@@ -93,6 +93,7 @@ class Go2ConnectionProtocol(Protocol):
     def set_obstacle_avoidance(self, enabled: bool = True) -> None: ...
     def set_rage_mode(self, enable: bool) -> bool: ...
     def publish_request(self, topic: str, data: dict) -> dict: ...  # type: ignore[type-arg]
+    def play_audio_track(self, audio_path: str) -> None: ...
 
 
 _FRONT_CAMERA_720_YAML = resources.files("dimos.robot.unitree.go2").joinpath(
@@ -213,6 +214,9 @@ class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
     def publish_request(self, topic: str, data: dict):  # type: ignore[no-untyped-def, type-arg]
         """Fake publish request for testing."""
         return {"status": "ok", "message": "Fake publish"}
+
+    def play_audio_track(self, audio_path: str) -> None:
+        """No-op: replay/sim backends have no robot speaker."""
 
 
 _Config = TypeVar("_Config", bound=ConnectionConfig, default=ConnectionConfig)
@@ -394,6 +398,19 @@ class GO2Connection(Module, Camera, Pointcloud):
             The result of the publish request
         """
         return self.connection.publish_request(topic, data)
+
+    @rpc
+    def play_audio_track(self, audio_path: str) -> None:
+        """Play an audio file through the robot's onboard speaker.
+
+        Delegates to the WebRTC connection wrapper. Guarded with hasattr so
+        non-WebRTC backends (mujoco/dimsim) that don't implement it stay silent
+        rather than raising.
+        """
+        if hasattr(self.connection, "play_audio_track"):
+            self.connection.play_audio_track(audio_path)
+        else:
+            logger.warning("Connection %s has no speaker; ignoring play_audio_track", type(self.connection).__name__)
 
     @skill
     def observe(self) -> Image | None:

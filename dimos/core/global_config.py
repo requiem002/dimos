@@ -68,6 +68,9 @@ class GlobalConfig(BaseSettings):
     build_native: bool = DEFAULT_BUILD_NATIVE
     dtop: bool = False
     obstacle_avoidance: bool = True
+    # Route agent TTS to the Go2's onboard speaker (over the existing WebRTC
+    # connection) instead of the Jetson's local audio device.
+    speak_through_robot: bool = False
     detection_model: VlModelName = "moondream"
     listen_host: str = "127.0.0.1"
     dimsim_scene: str = "apt"
