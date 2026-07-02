@@ -39,21 +39,33 @@ class VoiceActivityRecorder(AbstractAudioTransform):
     Only complete utterances reach the transcriber. RMS is cheap, so this runs
     per frame without the cost of per-frame transcription.
 
+    Speech is detected against an ADAPTIVE noise floor, not a fixed threshold: a
+    fixed threshold that sits below the robot mic's ambient noise floor never sees
+    silence, so every utterance runs to the max-length cap and buries the speech
+    in seconds of room noise. The floor tracks ambient level (falling fast toward
+    quiet, rising slowly), and a frame counts as speech only when it exceeds
+    floor * noise_floor_ratio (and a small absolute minimum so a dead-silent room
+    doesn't drive the gate to zero).
+
     Timing (silence, min/max length) is measured in AUDIO time via sample counts,
     not wall clock, so behaviour is independent of how fast frames arrive.
     """
 
     def __init__(
         self,
-        speech_rms_threshold: float = 0.015,
+        speech_rms_threshold: float = 0.01,
+        noise_floor_ratio: float = 2.5,
         silence_duration: float = 0.7,
         min_speech_duration: float = 0.4,
-        max_utterance_duration: float = 30.0,
+        max_utterance_duration: float = 15.0,
         pre_roll_duration: float = 0.3,
     ) -> None:
         """
         Args:
-            speech_rms_threshold: RMS (0..1) above which a frame counts as speech.
+            speech_rms_threshold: Absolute minimum RMS (0..1) for the speech gate,
+                so a dead-silent room doesn't drive the adaptive gate to zero.
+            noise_floor_ratio: A frame counts as speech when its RMS exceeds the
+                tracked ambient noise floor times this ratio.
             silence_duration: Trailing silence (s of audio) that ends an utterance.
             min_speech_duration: Utterances with less than this much speech (s) are
                 discarded as blips, so coughs/clicks don't reach the transcriber.
@@ -63,6 +75,7 @@ class VoiceActivityRecorder(AbstractAudioTransform):
                 word isn't clipped.
         """
         self.speech_rms_threshold = speech_rms_threshold
+        self.noise_floor_ratio = noise_floor_ratio
         self.silence_duration = silence_duration
         self.min_speech_duration = min_speech_duration
         self.max_utterance_duration = max_utterance_duration
@@ -88,6 +101,7 @@ class VoiceActivityRecorder(AbstractAudioTransform):
                 "pre_roll": [],  # list[np.ndarray] kept before speech onset
                 "pre_roll_samples": 0,
                 "sample_rate": None,
+                "noise_floor": None,  # tracked ambient RMS
             }
 
             def reset_utterance() -> None:
@@ -136,7 +150,23 @@ class VoiceActivityRecorder(AbstractAudioTransform):
 
                     state["sample_rate"] = event.sample_rate
                     max_pre_roll = int(self.pre_roll_duration * event.sample_rate)
-                    is_speech = calculate_rms_volume(frame) >= self.speech_rms_threshold
+
+                    rms = calculate_rms_volume(frame)
+                    floor = state["noise_floor"]
+                    if floor is None:
+                        floor = rms
+                    speech_gate = max(self.speech_rms_threshold, floor * self.noise_floor_ratio)
+                    is_speech = rms >= speech_gate
+
+                    # Track the ambient floor. Always fall fast toward any quieter
+                    # frame (so a floor seeded on a loud frame converges down and
+                    # can't get stuck high), but rise only on non-speech frames and
+                    # slowly (so speech never inflates the gate away from itself).
+                    if rms < floor:
+                        floor = 0.7 * floor + 0.3 * rms
+                    elif not is_speech:
+                        floor = 0.98 * floor + 0.02 * rms
+                    state["noise_floor"] = floor
 
                     if is_speech:
                         if not state["recording"]:

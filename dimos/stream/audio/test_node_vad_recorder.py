@@ -51,6 +51,11 @@ def _silence(n: int) -> list[AudioEvent]:
     return [_frame(0.0) for _ in range(n)]
 
 
+def _silence_at(level: float, n: int) -> list[AudioEvent]:
+    """Ambient 'silence' at a nonzero noise level (constant RMS == level)."""
+    return [_frame(level) for _ in range(n)]
+
+
 def _speech(n: int, level: float = 0.2) -> list[AudioEvent]:
     return [_frame(level) for _ in range(n)]
 
@@ -89,10 +94,19 @@ def test_two_utterances_separated_by_silence() -> None:
     assert len(out) == 2
 
 
+def test_high_ambient_floor_still_segments() -> None:
+    # Room noise sits at 0.03 RMS -- above the old fixed 0.015 threshold, which
+    # made every utterance run to the 30 s cap. The adaptive floor must treat
+    # 0.03 as silence and only 0.2 as speech, so the utterance still closes.
+    frames = _silence_at(0.03, 30) + _speech(40, level=0.2) + _silence_at(0.03, 40)
+    out = _run(frames, silence_duration=0.5, min_speech_duration=0.4)
+    assert len(out) == 1
+
+
 def test_pre_roll_prepends_audio_before_onset() -> None:
-    # No leading silence to trim from; pre-roll should still not error and the
-    # utterance should contain at least the speech samples.
-    frames = _speech(50) + _silence(40)
+    # A little leading ambient (as a real continuous mic always delivers before
+    # speech), then a burst. Utterance holds the speech plus the pre-roll.
+    frames = _silence(5) + _speech(50) + _silence(40)
     out = _run(frames, silence_duration=0.5, min_speech_duration=0.4)
     assert len(out) == 1
     assert out[0].data.shape[0] >= 50 * FRAME
