@@ -181,6 +181,21 @@ class SpeakSkill(Module):
 
         return self._speak_blocking(text)
 
+    @skill
+    def set_volume(self, level: int) -> str:
+        """Set the loudness of the robot's speaker.
+
+        Use when asked to speak louder/quieter or to change the volume.
+
+        Args:
+            level: Volume from 0 (mute) to 10 (maximum).
+        """
+        if self._connection is None:
+            return "Error: no robot connection; volume control is unavailable"
+        level = max(0, min(10, int(level)))
+        self._connection.set_volume(level)
+        return f"Speaker volume set to {level}/10"
+
     def _speak_bg(self, text: str) -> None:
         try:
             self._speak_blocking(text)

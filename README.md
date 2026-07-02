@@ -278,6 +278,7 @@ on the DimOS side; just speak and pause.
 | `force_local_audio` | `GlobalConfig` | Force both directions to host-local audio (debug override) |
 | `microphone` | `ConnectionConfig` (`dimos/robot/unitree/go2/connection.py`) | Disable the Go2 mic stream while keeping the speaker (`microphone: false`) |
 | `speech_rms_threshold`, `noise_floor_ratio`, `silence_duration`, `min_speech_duration` | `VoiceActivityRecorder` | Tune when speech starts/stops and which blips are ignored |
+| `set_volume` skill | `SpeakSkill` | Agent-invocable speaker volume 0–10 (Unitree VUI service, `api_id` 1003) — ask the robot to "speak louder" |
 
 ## Key files
 

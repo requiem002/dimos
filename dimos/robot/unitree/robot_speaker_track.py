@@ -14,11 +14,12 @@
 
 import asyncio
 import fractions
+import time
 
 from aiortc import MediaStreamTrack
-from aiortc.contrib.media import MediaPlayer
 from aiortc.mediastreams import MediaStreamError
 import av
+import numpy as np
 
 from dimos.utils.logging_config import setup_logger
 
@@ -29,6 +30,41 @@ CHANNELS = 2
 SAMPLES_PER_FRAME = 960  # 20 ms at 48 kHz, matching aiortc's audio frame size
 FRAME_DURATION = SAMPLES_PER_FRAME / SAMPLE_RATE
 TIME_BASE = fractions.Fraction(1, SAMPLE_RATE)
+# Interleaved int16 values per frame (samples x channels).
+_VALUES_PER_FRAME = SAMPLES_PER_FRAME * CHANNELS
+# If the event loop stalls long enough that we fall this far behind the pacing
+# clock, re-anchor instead of bursting frames to catch up (a burst would flood
+# the robot's jitter buffer; a re-anchor is one recoverable timeline step).
+_MAX_LAG_SECONDS = 1.0
+
+_SILENCE = np.zeros(_VALUES_PER_FRAME, dtype=np.int16)
+
+
+def decode_clip_to_pcm(audio_path: str) -> np.ndarray:
+    """Decode an audio file to the track's wire format: 48 kHz stereo s16,
+    returned as 1-D interleaved int16.
+
+    Resampling happens HERE, once, with the frame's native pts intact — not in
+    aiortc's encoder. The encoder derives RTP timestamps from frame pts, so
+    frames handed to the sender must already be in 48 kHz units or the RTP
+    timeline runs at the wrong rate (see RobotSpeakerTrack docstring).
+    """
+    container = av.open(audio_path)
+    resampler = av.AudioResampler(format="s16", layout="stereo", rate=SAMPLE_RATE)
+    chunks: list[np.ndarray] = []
+    try:
+        for frame in container.decode(audio=0):
+            # Let the resampler treat the stream as gapless rather than
+            # compensating for container pts jitter.
+            frame.pts = None
+            chunks += [out.to_ndarray() for out in resampler.resample(frame)]
+        chunks += [out.to_ndarray() for out in resampler.resample(None)]  # flush
+    finally:
+        container.close()
+    if not chunks:
+        return np.zeros(0, dtype=np.int16)
+    # Packed s16 frames come out as (1, samples*channels) interleaved.
+    return np.concatenate(chunks, axis=1).reshape(-1)
 
 
 class RobotSpeakerTrack(MediaStreamTrack):
@@ -36,82 +72,92 @@ class RobotSpeakerTrack(MediaStreamTrack):
 
     A single instance is attached ONCE to the connection's pre-negotiated audio
     sender and lives for the whole WebRTC session. It emits digital silence when
-    idle and the current clip's frames when speaking, and it NEVER raises
+    idle and the current clip's PCM while speaking, and it NEVER raises
     MediaStreamError. This is deliberate: aiortc tears the sender's RTP loop down
     permanently the first time a track signals end-of-file (rtcrtpsender.py
     `_run_rtp` exits on MediaStreamError), and the Go2 does not support SDP
-    renegotiation, so a torn-down sender cannot be revived. Keeping one
-    never-ending track alive lets every subsequent utterance reuse the same
-    sender by simply swapping the internal source.
+    renegotiation, so a torn-down sender cannot be revived.
+
+    Every frame is a uniform 20 ms of 48 kHz stereo s16 with pts advancing by
+    exactly SAMPLES_PER_FRAME in 1/48000 time base. This uniformity is a hard
+    correctness requirement, not a convenience: aiortc's Opus encoder derives
+    RTP timestamps from frame pts. An earlier version fed the sender clips at
+    their native rate (24 kHz TTS WAVs) while stamping pts in 48 kHz units, so
+    the RTP timeline advanced at half real time during clips — the encoder's
+    resampler dropped overlapping samples (garbled, quiet audio) and after one
+    clip the timeline lagged seconds behind arrival, so the robot's jitter
+    buffer discarded every later packet (speaker "worked once per boot").
+    Clips are therefore decoded/resampled to the wire format up front
+    (decode_clip_to_pcm) and the track only ever emits wire-format frames.
+
+    Frames are paced against an absolute wall-clock anchor (anchor +
+    samples_sent / 48000), not by sleeping a fixed 20 ms per frame: incremental
+    sleeps overshoot and the drift compounds, which slews the RTP timeline away
+    from real time the same way the unit bug did, just slower.
     """
 
     kind = "audio"
 
     def __init__(self) -> None:
         super().__init__()
-        self._source: MediaPlayer | None = None
-        self._source_track: MediaStreamTrack | None = None
-        # Monotonic sample clock. Every emitted frame (silence or clip) is
-        # re-stamped from this so timestamps never reset between clips — each
-        # MediaPlayer restarts its own pts at 0, which would otherwise make the
-        # Opus encoder's RTP timestamps regress and glitch the stream.
-        self._timestamp = 0
+        self._pcm: np.ndarray | None = None  # current clip, 1-D interleaved s16
+        self._offset = 0  # read position into _pcm, in int16 values
+        self._timestamp = 0  # samples sent, monotonic across clips
+        self._anchor: float | None = None  # wall-clock time of sample 0
 
-    def play(self, player: MediaPlayer) -> None:
-        """Switch the active source to ``player`` (scheduled on the loop thread).
+    def play_pcm(self, pcm: np.ndarray) -> None:
+        """Make ``pcm`` (from decode_clip_to_pcm) the active clip.
 
-        Any in-flight clip is stopped and released so its decode thread and file
-        handle don't leak. Called on the connection's event-loop thread, the same
-        thread as ``recv``, so the swap needs no extra locking.
+        Replaces any clip still playing, matching the speak path's semantics of
+        one utterance at a time. Called on the connection's event-loop thread —
+        the same thread as ``recv`` — so the swap needs no locking.
         """
-        old = self._source
-        self._source = player
-        self._source_track = player.audio
-        if old is not None and old is not player:
-            self._stop_player(old)
+        self._pcm = pcm if pcm.size else None
+        self._offset = 0
 
     async def recv(self) -> av.AudioFrame:
         if self.readyState != "live":
             raise MediaStreamError
 
-        frame = None
-        track = self._source_track
-        if track is not None:
-            try:
-                frame = await track.recv()
-            except MediaStreamError:
-                # Current clip reached end-of-file: release it and fall through
-                # to silence. Crucially we do NOT propagate this error, so the
-                # sender keeps running and the next utterance can reuse it.
-                finished = self._source
-                self._source = None
-                self._source_track = None
-                if finished is not None:
-                    self._stop_player(finished)
+        # Pace against the absolute anchor so per-sleep overshoot can't compound.
+        if self._anchor is None:
+            self._anchor = time.monotonic()
+        target = self._anchor + self._timestamp / SAMPLE_RATE
+        now = time.monotonic()
+        if target > now:
+            await asyncio.sleep(target - now)
+        elif now - target > _MAX_LAG_SECONDS:
+            logger.warning(
+                "Speaker track fell %.2fs behind (event loop stall); re-anchoring",
+                now - target,
+            )
+            self._anchor = now - self._timestamp / SAMPLE_RATE
 
-        if frame is None:
-            frame = self._silence_frame()
-            # Clip frames are already paced to real time by MediaPlayer's
-            # throttling; silence frames are not, so pace them ourselves.
-            await asyncio.sleep(FRAME_DURATION)
+        if self._pcm is not None:
+            chunk = self._pcm[self._offset : self._offset + _VALUES_PER_FRAME]
+            self._offset += _VALUES_PER_FRAME
+            if self._offset >= self._pcm.size:
+                self._pcm = None
+                self._offset = 0
+            if chunk.size < _VALUES_PER_FRAME:
+                chunk = np.concatenate(
+                    [chunk, np.zeros(_VALUES_PER_FRAME - chunk.size, dtype=np.int16)]
+                )
+            data = chunk
+        else:
+            data = _SILENCE
 
+        frame = av.AudioFrame(format="s16", layout="stereo", samples=SAMPLES_PER_FRAME)
+        frame.planes[0].update(data.tobytes())
+        frame.sample_rate = SAMPLE_RATE
         frame.pts = self._timestamp
         frame.time_base = TIME_BASE
-        self._timestamp += frame.samples
+        self._timestamp += SAMPLES_PER_FRAME
         return frame
 
     @staticmethod
     def _silence_frame() -> av.AudioFrame:
         frame = av.AudioFrame(format="s16", layout="stereo", samples=SAMPLES_PER_FRAME)
-        for plane in frame.planes:
-            plane.update(bytes(plane.buffer_size))
+        frame.planes[0].update(_SILENCE.tobytes())
         frame.sample_rate = SAMPLE_RATE
         return frame
-
-    @staticmethod
-    def _stop_player(player: MediaPlayer) -> None:
-        try:
-            if player.audio is not None:
-                player.audio.stop()
-        except Exception as e:
-            logger.debug("Error stopping previous speaker clip: %s", e)

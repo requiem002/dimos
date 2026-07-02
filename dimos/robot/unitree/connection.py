@@ -259,12 +259,21 @@ class UnitreeWebRTCConnection(Resource):
         concurrent robot commands (move, etc.) are not stalled and long clips
         cannot trip RPC timeouts.
         """
-        from aiortc.contrib.media import MediaPlayer
+        from dimos.robot.unitree.robot_speaker_track import (
+            RobotSpeakerTrack,
+            decode_clip_to_pcm,
+        )
 
-        from dimos.robot.unitree.robot_speaker_track import RobotSpeakerTrack
+        # Decode + resample to the wire format HERE, on the calling thread, so
+        # the event loop only ever handles ready-made 48 kHz frames (see
+        # RobotSpeakerTrack docstring for why the format must be exact).
+        try:
+            pcm = decode_clip_to_pcm(audio_path)
+        except Exception as e:
+            logger.warning("Failed to decode audio clip %s: %s", audio_path, e)
+            return
 
         async def async_play() -> None:
-            player = MediaPlayer(audio_path)
             if self._speaker_track is None:
                 audio_sender = next(
                     (s for s in self.conn.pc.getSenders() if s.kind == "audio"), None
@@ -277,12 +286,28 @@ class UnitreeWebRTCConnection(Resource):
                 # transceiver the library pre-negotiated as sendrecv at connect.
                 audio_sender.replaceTrack(track)
                 self._speaker_track = track
-            self._speaker_track.play(player)
+            self._speaker_track.play_pcm(pcm)
 
         try:
             asyncio.run_coroutine_threadsafe(async_play(), self.loop).result()
         except Exception as e:
             logger.warning("Failed to play audio on robot speaker: %s", e)
+
+    def set_volume(self, level: int) -> None:
+        """Set the robot's speaker volume, 0 (mute) to 10 (max), via the VUI
+        service on the datachannel (api_id 1003 — the same call the reference
+        library's vui.py example uses)."""
+        level = max(0, min(10, int(level)))
+
+        async def async_set_volume() -> None:
+            await self.conn.datachannel.pub_sub.publish_request_new(
+                RTC_TOPIC["VUI"], {"api_id": 1003, "parameter": {"volume": level}}
+            )
+
+        try:
+            asyncio.run_coroutine_threadsafe(async_set_volume(), self.loop).result()
+        except Exception as e:
+            logger.warning("Failed to set robot speaker volume: %s", e)
 
     # Generic conversion of unitree subscription to Subject (used for all subs)
     def unitree_sub_stream(self, topic_name: str):  # type: ignore[no-untyped-def]

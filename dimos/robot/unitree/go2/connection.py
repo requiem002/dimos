@@ -97,6 +97,7 @@ class Go2ConnectionProtocol(Protocol):
     def set_rage_mode(self, enable: bool) -> bool: ...
     def publish_request(self, topic: str, data: dict) -> dict: ...  # type: ignore[type-arg]
     def play_audio_track(self, audio_path: str) -> None: ...
+    def set_volume(self, level: int) -> None: ...
 
 
 _FRONT_CAMERA_720_YAML = resources.files("dimos.robot.unitree.go2").joinpath(
@@ -224,6 +225,9 @@ class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
         return {"status": "ok", "message": "Fake publish"}
 
     def play_audio_track(self, audio_path: str) -> None:
+        """No-op: replay/sim backends have no robot speaker."""
+
+    def set_volume(self, level: int) -> None:
         """No-op: replay/sim backends have no robot speaker."""
 
 
@@ -425,6 +429,15 @@ class GO2Connection(Module, Camera, Pointcloud):
             self.connection.play_audio_track(audio_path)
         else:
             logger.warning("Connection %s has no speaker; ignoring play_audio_track", type(self.connection).__name__)
+
+    @rpc
+    def set_volume(self, level: int) -> None:
+        """Set the robot's speaker volume (0-10). Same hasattr guard as
+        play_audio_track for non-WebRTC backends."""
+        if hasattr(self.connection, "set_volume"):
+            self.connection.set_volume(level)
+        else:
+            logger.warning("Connection %s has no speaker; ignoring set_volume", type(self.connection).__name__)
 
     @skill
     def observe(self) -> Image | None:
