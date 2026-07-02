@@ -20,3 +20,15 @@ from dimos.spec.utils import Spec
 class GO2ConnectionSpec(Spec, Protocol):
     def publish_request(self, topic: str, data: dict[str, Any]) -> dict[Any, Any]: ...
     def play_audio_track(self, audio_path: str) -> None: ...
+
+
+def use_robot_audio(connection: object | None, force_local_audio: bool) -> bool:
+    """Single decision point for routing agent audio to the robot vs. local devices.
+
+    Robot audio (speaker + mic) is the default whenever a connection is injected;
+    fall back to local audio only when there is no robot connection (non-robot
+    blueprints, unit tests) or when the operator forces local audio via config.
+    Governs both SpeakSkill (speaker out) and WebInput (mic in) so the two
+    directions stay in lock-step. See requirements FR-D1..D4.
+    """
+    return connection is not None and not force_local_audio

@@ -42,6 +42,7 @@ from dimos.msgs.geometry_msgs.Transform import Transform
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+from dimos.stream.audio.base import AudioEvent
 from dimos.robot.unitree.type.lidar import (
     RawLidarMsg,
     pointcloud2_from_webrtc_lidar,
@@ -92,6 +93,29 @@ class SerializableVideoFrame:
 
     def to_ndarray(self, format=None):  # type: ignore[no-untyped-def]
         return self.data
+
+
+@dataclass
+class SerializableAudioFrame:
+    """Pickleable wrapper for one av.AudioFrame from the robot mic.
+
+    The Go2 mic delivers 48 kHz stereo int16 frames (~960 samples each). We pull
+    the interleaved samples out immediately in the callback so nothing downstream
+    holds a live aiortc frame.
+    """
+
+    data: np.ndarray  # int16, interleaved
+    sample_rate: int
+    channels: int
+
+    @classmethod
+    def from_av_frame(cls, frame):  # type: ignore[no-untyped-def]
+        layout = getattr(frame, "layout", None)
+        channels = len(layout.channels) if layout and layout.channels else 2
+        sample_rate = getattr(frame, "sample_rate", None) or 48000
+        # frombuffer yields a read-only view; copy so downstream owns writable memory.
+        data = np.frombuffer(frame.to_ndarray().tobytes(), dtype=np.int16).copy()
+        return cls(data=data, sample_rate=sample_rate, channels=channels)
 
 
 class UnitreeWebRTCConnection(Resource):
@@ -340,6 +364,63 @@ class UnitreeWebRTCConnection(Resource):
                 ops.map(time_is_now),
             )
         )
+
+    @simple_mcache
+    def raw_audio_stream(self) -> Observable[SerializableAudioFrame]:
+        """Mic frames off the EXISTING WebRTC connection.
+
+        Mirrors raw_video_stream, but the library's audio channel invokes the
+        registered callback with each decoded frame (it runs the recv loop for
+        us), so there is no self-driven recv loop here. Enabling/disabling the
+        mic is scheduled onto the persistent loop, exactly like the video
+        channel switch.
+        """
+        subject: Subject[SerializableAudioFrame] = Subject()
+
+        async def accept_frame(frame) -> None:  # type: ignore[no-untyped-def]
+            subject.on_next(SerializableAudioFrame.from_av_frame(frame))
+
+        self.conn.audio.add_track_callback(accept_frame)
+
+        def switch_audio_channel() -> None:
+            self.conn.audio.switchAudioChannel(True)
+
+        self.loop.call_soon_threadsafe(switch_audio_channel)
+
+        def stop() -> None:
+            try:
+                self.conn.audio.track_callbacks.remove(accept_frame)
+            except ValueError:
+                pass
+
+            def switch_audio_channel_off() -> None:
+                self.conn.audio.switchAudioChannel(False)
+
+            self.loop.call_soon_threadsafe(switch_audio_channel_off)
+
+        return subject.pipe(ops.finally_action(stop))
+
+    @simple_mcache
+    def audio_stream(self) -> Observable[AudioEvent]:
+        """Robot mic as native 48 kHz stereo AudioEvents.
+
+        Consumers (STT) resample to their own rate — the connection stays
+        format-agnostic, mirroring how it publishes a generic Image and lets
+        perception adapt.
+        """
+
+        def to_event(payload: SerializableAudioFrame) -> AudioEvent:
+            data = payload.data
+            if payload.channels > 1:
+                data = data.reshape(-1, payload.channels)
+            return AudioEvent(
+                data=data,
+                sample_rate=payload.sample_rate,
+                timestamp=time.time(),
+                channels=payload.channels,
+            )
+
+        return backpressure(self.raw_audio_stream().pipe(ops.map(to_event)))
 
     @simple_mcache
     def lowstate_stream(self) -> Observable[LowStateMsg]:

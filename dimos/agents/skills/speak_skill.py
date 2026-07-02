@@ -25,7 +25,7 @@ from dimos.agents.annotation import skill
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
-from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec
+from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec, use_robot_audio
 from dimos.stream.audio.node_output import SounddeviceAudioOutput
 from dimos.stream.audio.tts.node_openai import OpenAITTSNode, Voice
 from dimos.utils.logging_config import setup_logger
@@ -40,8 +40,19 @@ _ROBOT_PLAYBACK_MARGIN_FACTOR = 1.15
 _ROBOT_PLAYBACK_MARGIN_SECONDS = 0.5
 
 
+def _robot_playback_wait(clip_duration: float) -> float:
+    """Seconds to block after handing a clip to the robot so the next utterance
+    cannot clip its tail.
+
+    Duration-based with a margin rather than the real playback-ended signal,
+    which lives behind the RPC boundary in the dedicated_worker connection
+    process (see requirements DR-S3).
+    """
+    return clip_duration * _ROBOT_PLAYBACK_MARGIN_FACTOR + _ROBOT_PLAYBACK_MARGIN_SECONDS
+
+
 class SpeakSkillConfig(ModuleConfig):
-    speak_through_robot: bool = Field(default_factory=lambda m: m["g"].speak_through_robot)
+    force_local_audio: bool = Field(default_factory=lambda m: m["g"].force_local_audio)
 
 
 class SpeakSkill(Module):
@@ -56,12 +67,22 @@ class SpeakSkill(Module):
     _robot_audio_sub = None
     _robot_clip_dispatched: threading.Event = threading.Event()
     _robot_clip_duration: float = 0.0
+    _speak_through_robot: bool = False
+
+    @staticmethod
+    def _should_use_robot_speaker(connection: object | None, force_local_audio: bool) -> bool:
+        """Thin wrapper over the shared use_robot_audio decision so the speaker
+        and mic paths route identically. See requirements FR-D1..D4."""
+        return use_robot_audio(connection, force_local_audio)
 
     @rpc
     def start(self) -> None:
         super().start()
         self._tts_node = OpenAITTSNode(speed=1.2, voice=Voice.ONYX)
-        if self.config.speak_through_robot:
+        self._speak_through_robot = self._should_use_robot_speaker(
+            self._connection, self.config.force_local_audio
+        )
+        if self._speak_through_robot:
             # Route TTS to the robot speaker only — skip the local audio device.
             self._robot_audio_sub = self._tts_node.emit_audio().subscribe(
                 on_next=self._play_on_robot,
@@ -107,7 +128,7 @@ class SpeakSkill(Module):
             if self._connection is not None:
                 self._connection.play_audio_track(path)
             else:
-                logger.warning("speak_through_robot is set but no robot connection is wired")
+                logger.warning("Robot speaker selected but no robot connection is wired")
 
             # Remove the temp file once playback (plus margin) is well past.
             cleanup_delay = self._robot_clip_duration + 5.0
@@ -166,7 +187,7 @@ class SpeakSkill(Module):
             if self._tts_node is None:
                 return "Error: TTS not initialized"
 
-            if self.config.speak_through_robot:
+            if self._speak_through_robot:
                 return self._speak_blocking_robot(text)
 
             text_subject: Subject[str] = Subject()
@@ -219,9 +240,5 @@ class SpeakSkill(Module):
             logger.warning(f"TTS timeout reached for: {text}")
             return f"Warning: TTS timeout while speaking: {text}"
 
-        playback_wait = (
-            self._robot_clip_duration * _ROBOT_PLAYBACK_MARGIN_FACTOR
-            + _ROBOT_PLAYBACK_MARGIN_SECONDS
-        )
-        time.sleep(playback_wait)
+        time.sleep(_robot_playback_wait(self._robot_clip_duration))
         return f"Spoke: {text}"

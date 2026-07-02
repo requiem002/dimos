@@ -51,6 +51,7 @@ from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.robot.unitree.connection import UnitreeWebRTCConnection
 from dimos.robot.unitree.type.lowstate import LowStateMsg
+from dimos.stream.audio.base import AudioEvent
 from dimos.utils.decorators.decorators import cached_property, simple_mcache
 
 if sys.version_info < (3, 13):
@@ -71,6 +72,7 @@ class ConnectionConfig(ModuleConfig):
     mode: Go2Mode = Go2Mode.DEFAULT
     lidar: bool = True
     camera: bool = True
+    microphone: bool = True
     # "mcf" for stair traversal, "normal" for basic, None to leave it as is
     motion_mode: str | None = None
     # Per-device AES-128 key (Go2 fw >=1.1.15); defaults from GlobalConfig.
@@ -85,6 +87,7 @@ class Go2ConnectionProtocol(Protocol):
     def lidar_stream(self) -> Observable[PointCloud2]: ...
     def odom_stream(self) -> Observable[PoseStamped]: ...
     def video_stream(self) -> Observable[Image]: ...
+    def audio_stream(self) -> Observable[AudioEvent]: ...
     def lowstate_stream(self) -> Observable[LowStateMsg]: ...
     def move(self, twist: Twist, duration: float = 0.0) -> bool: ...
     def standup(self) -> bool: ...
@@ -204,6 +207,11 @@ class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
         return self.replay.streams.color_image.observable()
 
     @simple_mcache
+    def audio_stream(self) -> Observable[AudioEvent]:
+        # Replay/sim datasets carry no robot mic audio — emit nothing.
+        return empty()
+
+    @simple_mcache
     def lowstate_stream(self) -> Observable:  # type: ignore[type-arg]
         # Replay datasets carry no low-level state (battery/IMU) — emit nothing.
         return empty()
@@ -232,6 +240,7 @@ class GO2Connection(Module, Camera, Pointcloud):
     lidar: Out[PointCloud2]
     color_image: Out[Image]
     camera_info: Out[CameraInfo]
+    mic_audio: Out[AudioEvent]
 
     connection: Go2ConnectionProtocol
     camera_info_static: CameraInfo = _camera_info_static()
@@ -282,6 +291,11 @@ class GO2Connection(Module, Camera, Pointcloud):
                 daemon=True,
             )
             self._camera_info_thread.start()
+
+        if self.config.microphone:
+            self.register_disposable(
+                self.connection.audio_stream().subscribe(self.mic_audio.publish)
+            )
 
         if self.config.motion_mode and isinstance(self.connection, UnitreeWebRTCConnection):
             self.connection.set_motion_mode(self.config.motion_mode)

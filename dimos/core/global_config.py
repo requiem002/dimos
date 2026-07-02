@@ -68,9 +68,12 @@ class GlobalConfig(BaseSettings):
     build_native: bool = DEFAULT_BUILD_NATIVE
     dtop: bool = False
     obstacle_avoidance: bool = True
-    # Route agent TTS to the Go2's onboard speaker (over the existing WebRTC
-    # connection) instead of the Jetson's local audio device.
-    speak_through_robot: bool = False
+    # Force agent audio through the Jetson's LOCAL audio devices even when a
+    # robot connection is present. Default False: whenever a robot connection
+    # exists, agent audio routes to the Go2's onboard speaker (and microphone),
+    # falling back to local audio only when there is no connection. This flag is
+    # only a debug/override escape hatch, not the on/off switch for the feature.
+    force_local_audio: bool = False
     detection_model: VlModelName = "moondream"
     listen_host: str = "127.0.0.1"
     dimsim_scene: str = "apt"

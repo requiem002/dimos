@@ -13,29 +13,54 @@
 # limitations under the License.
 
 from threading import Thread
-from typing import TYPE_CHECKING
 
+from pydantic import Field
 import reactivex as rx
 import reactivex.operators as ops
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
-from dimos.core.module import Module
+from dimos.core.module import Module, ModuleConfig
+from dimos.core.stream import In
 from dimos.core.transport import pLCMTransport
+from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec, use_robot_audio
+from dimos.stream.audio.base import AudioEvent
 from dimos.stream.audio.node_normalizer import AudioNormalizer
+from dimos.stream.audio.resample import resample_audio_event
 from dimos.utils.logging_config import setup_logger
 from dimos.web.robot_web_interface import RobotWebInterface
-
-if TYPE_CHECKING:
-    from dimos.stream.audio.base import AudioEvent
 
 logger = setup_logger()
 
 
+class WebInputConfig(ModuleConfig):
+    force_local_audio: bool = Field(default_factory=lambda m: m["g"].force_local_audio)
+
+
 class WebInput(Module):
+    config: WebInputConfig
+
     _web_interface: RobotWebInterface | None = None
     _thread: Thread | None = None
     _human_transport: pLCMTransport[str] | None = None
+    _connection: GO2ConnectionSpec | None = None
+    mic_audio: In[AudioEvent]
+
+    def _stt_audio_source(
+        self, browser_audio: rx.Observable
+    ) -> rx.Observable:  # type: ignore[type-arg]
+        """Pick the STT source: robot mic by default, browser audio as fallback.
+
+        Robot when a connection is injected and local audio isn't forced (the
+        shared use_robot_audio rule that also governs the speaker). The robot mic
+        arrives as native 48 kHz stereo AudioEvents, so resample to Whisper's
+        16 kHz mono float32 here. See requirements FR-M1..M6.
+        """
+        if use_robot_audio(self._connection, self.config.force_local_audio):
+            logger.info("STT source: robot onboard microphone")
+            return self.mic_audio.observable().pipe(ops.map(resample_audio_event))
+        logger.info("STT source: browser web audio")
+        return browser_audio.pipe(ops.share())
 
     @rpc
     def start(self) -> None:
@@ -58,8 +83,8 @@ class WebInput(Module):
 
         stt_node = WhisperNode()
 
-        # Connect audio pipeline: browser audio → normalizer → whisper
-        normalizer.consume_audio(audio_subject.pipe(ops.share()))
+        # Connect audio pipeline: <robot mic | browser audio> → normalizer → whisper
+        normalizer.consume_audio(self._stt_audio_source(audio_subject))
         stt_node.consume_audio(normalizer.emit_audio())
 
         # Subscribe to both text input sources
