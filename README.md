@@ -216,6 +216,79 @@ dimos stop                                # Shut down
 > Full CLI reference: [docs/usage/cli.md](docs/usage/cli.md)
 
 
+# Robot Voice I/O (Go2 speaker + microphone)
+
+On a Unitree Go2 the agent talks and listens through the **robot's own speaker
+and microphone**, not the host machine's audio devices. Both directions ride the
+**single, already-negotiated WebRTC connection** — no second connection is opened
+and no SDP renegotiation happens (the Go2 tolerates one connection per boot).
+
+| Direction | Path |
+|-----------|------|
+| **Speak (TTS out)** | `speak` skill → OpenAI TTS → `RobotSpeakerTrack` swapped onto the pre-negotiated audio sender with `replaceTrack` → Go2 speaker |
+| **Listen (STT in)** | Go2 mic → `GO2Connection.audio_stream` (48 kHz stereo `AudioEvent`) → `WebInput` resamples to 16 kHz mono → voice-activity gate → Whisper → `/human_input` |
+
+## How it decides: robot vs. local
+
+One shared rule governs both directions, so the speaker and mic always stay in
+lock-step (`use_robot_audio` in `dimos/robot/unitree/go2/connection_spec.py`):
+
+```
+use robot audio  ==  a robot connection is present  AND  force_local_audio is False
+```
+
+- **Default (connection present):** speak through the Go2 speaker, listen through
+  the Go2 mic.
+- **No connection (sim, replay, non-robot blueprint):** fall back to local audio
+  out and browser push-to-talk in.
+- **`force_local_audio: true`** (`GlobalConfig`, `dimos/core/global_config.py`):
+  debug override that forces both directions back to the host's local devices
+  even when a robot is connected.
+
+## The speaker track (why one persistent track)
+
+aiortc permanently tears an RTP sender down the first time a track signals
+end-of-file, and the Go2 cannot renegotiate to rebuild it. So a single
+`RobotSpeakerTrack` (`dimos/robot/unitree/robot_speaker_track.py`) is attached
+once and lives for the whole session: it emits digital silence when idle and the
+current clip's frames while speaking, and **never** raises end-of-file. Each new
+utterance just swaps the track's internal source — the sender keeps running.
+
+## The microphone gate (why voice-activity detection)
+
+The Go2 mic is a **continuous** ~50 fps stream that never stops — unlike the
+browser's push-to-talk source it replaced. Feeding it frame-by-frame into Whisper
+would transcribe every ~20 ms fragment, saturate the CPU, and flood the agent
+with blank/hallucinated turns. `VoiceActivityRecorder`
+(`dimos/stream/audio/node_vad_recorder.py`) sits in front of Whisper on the robot
+branch only: it buffers audio once speech begins (with a short pre-roll) and emits
+**one clip per utterance** after trailing silence. Speech is detected against an
+**adaptive noise floor** (a frame is speech only when it rises a set ratio above
+the tracked ambient level), so it works across rooms and mic gains without a fixed
+threshold. Blank transcriptions are also dropped before reaching `/human_input`.
+
+The robot's firmware wake-word ("Hey Benben") runs independently — the WebRTC
+audio channel streams the raw mic to DimOS in parallel, so no wake word is needed
+on the DimOS side; just speak and pause.
+
+## Config knobs
+
+| Setting | Where | Effect |
+|---------|-------|--------|
+| `force_local_audio` | `GlobalConfig` | Force both directions to host-local audio (debug override) |
+| `microphone` | `ConnectionConfig` (`dimos/robot/unitree/go2/connection.py`) | Disable the Go2 mic stream while keeping the speaker (`microphone: false`) |
+| `speech_rms_threshold`, `noise_floor_ratio`, `silence_duration`, `min_speech_duration` | `VoiceActivityRecorder` | Tune when speech starts/stops and which blips are ignored |
+
+## Key files
+
+- `dimos/agents/skills/speak_skill.py` — the `speak` skill and robot-speaker routing
+- `dimos/robot/unitree/robot_speaker_track.py` — persistent outbound speaker track
+- `dimos/robot/unitree/connection.py` — `play_audio_track` (speaker) and `audio_stream` (mic) on the WebRTC connection
+- `dimos/agents/web_human_input.py` — STT source selection and utterance gating
+- `dimos/stream/audio/node_vad_recorder.py` — voice-activity utterance recorder
+- `dimos/stream/audio/resample.py` — 48 kHz stereo → 16 kHz mono for Whisper
+
+
 # Usage
 
 ## Use DimOS as a Library

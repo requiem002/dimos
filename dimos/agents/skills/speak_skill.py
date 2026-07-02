@@ -68,6 +68,7 @@ class SpeakSkill(Module):
     _robot_clip_dispatched: threading.Event = threading.Event()
     _robot_clip_duration: float = 0.0
     _speak_through_robot: bool = False
+    _text_subject: Subject[str] | None = None
 
     @staticmethod
     def _should_use_robot_speaker(connection: object | None, force_local_audio: bool) -> bool:
@@ -79,6 +80,12 @@ class SpeakSkill(Module):
     def start(self) -> None:
         super().start()
         self._tts_node = OpenAITTSNode(speed=1.2, voice=Voice.ONYX)
+        # Feed the TTS node from ONE long-lived text subject. consume_text spawns
+        # a processing thread and a subscription, so calling it per utterance (as
+        # before) leaked a thread and a subscriber on every speak() for the whole
+        # session. Push text into this subject instead; never complete it.
+        self._text_subject = Subject()
+        self._tts_node.consume_text(self._text_subject)
         self._speak_through_robot = self._should_use_robot_speaker(
             self._connection, self.config.force_local_audio
         )
@@ -101,6 +108,9 @@ class SpeakSkill(Module):
         if self._robot_audio_sub is not None:
             self._robot_audio_sub.dispose()
             self._robot_audio_sub = None
+        if self._text_subject is not None:
+            self._text_subject.on_completed()
+            self._text_subject = None
         if self._tts_node:
             self._tts_node.dispose()
             self._tts_node = None
@@ -190,9 +200,8 @@ class SpeakSkill(Module):
             if self._speak_through_robot:
                 return self._speak_blocking_robot(text)
 
-            text_subject: Subject[str] = Subject()
+            assert self._text_subject is not None
             audio_complete = threading.Event()
-            self._tts_node.consume_text(text_subject)
 
             def set_as_complete(_t: str) -> None:
                 audio_complete.set()
@@ -205,8 +214,7 @@ class SpeakSkill(Module):
                 on_error=set_as_complete_e,
             )
 
-            text_subject.on_next(text)
-            text_subject.on_completed()
+            self._text_subject.on_next(text)
 
             timeout = max(5, len(text) * 0.1)
 
@@ -225,15 +233,13 @@ class SpeakSkill(Module):
     def _speak_blocking_robot(self, text: str) -> str:
         # Caller (_speak_blocking) already holds self._audio_lock.
         assert self._tts_node is not None
+        assert self._text_subject is not None
 
         # Drive completion off the audio dispatch, not emit_text: the TTS node
         # emits the text before the audio, so waiting on text could return
         # before _play_on_robot has handed the clip to the robot.
         self._robot_clip_dispatched.clear()
-        text_subject: Subject[str] = Subject()
-        self._tts_node.consume_text(text_subject)
-        text_subject.on_next(text)
-        text_subject.on_completed()
+        self._text_subject.on_next(text)
 
         timeout = max(5, len(text) * 0.1)
         if not self._robot_clip_dispatched.wait(timeout=timeout):
