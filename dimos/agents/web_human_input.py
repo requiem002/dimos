@@ -92,7 +92,10 @@ class WebInput(Module):
         # Here to prevent unwanted imports in the file.
         from dimos.stream.audio.stt.node_whisper import WhisperNode
 
-        stt_node = WhisperNode()
+        # base.en is markedly more accurate than multilingual base for English
+        # speech on the robot's noisy mic (the multilingual model hallucinates
+        # other scripts under noise). Weights download on first use (~140 MB).
+        stt_node = WhisperNode(model="base.en")
 
         # Connect audio pipeline: <robot mic | browser audio> → normalizer → whisper
         normalizer.consume_audio(self._stt_audio_source(audio_subject))

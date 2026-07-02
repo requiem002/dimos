@@ -271,6 +271,20 @@ The robot's firmware wake-word ("Hey Benben") runs independently — the WebRTC
 audio channel streams the raw mic to DimOS in parallel, so no wake word is needed
 on the DimOS side; just speak and pause.
 
+**Echo gate (half-duplex):** the Go2's mic hears its own speaker loudly enough to
+trip the voice gate, so while the speaker track is playing a clip (plus a ~1 s
+playout-latency tail) incoming mic frames are dropped at the connection
+(`_ECHO_GATE_TAIL_SECONDS` in `dimos/robot/unitree/connection.py`). Practical
+consequence: the robot cannot hear you *while it is talking* — wait for it to
+finish, then speak.
+
+**Tuning the mic:** the voice gate logs a periodic diagnostic line —
+`Mic level: peak_rms=… noise_floor=… speech_gate=…` — every ~10 s. If your
+speech doesn't trigger transcription, compare your spoken `peak_rms` against
+`speech_gate` in the logs and adjust `speech_rms_threshold` / `noise_floor_ratio`
+on `VoiceActivityRecorder` accordingly. STT uses Whisper `base.en` (English-only;
+weights download on first use).
+
 ## Config knobs
 
 | Setting | Where | Effect |

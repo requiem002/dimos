@@ -58,6 +58,10 @@ VideoMessage: TypeAlias = NDArray[np.uint8]  # Shape: (height, width, 3)
 
 logger = setup_logger()
 
+# How long after the speaker track's last clip frame the mic stays gated,
+# covering network + jitter-buffer + playout latency of the robot's speaker.
+_ECHO_GATE_TAIL_SECONDS = 1.0
+
 
 _T = TypeVar("_T", bound=Timestamped)
 
@@ -399,10 +403,18 @@ class UnitreeWebRTCConnection(Resource):
         us), so there is no self-driven recv loop here. Enabling/disabling the
         mic is scheduled onto the persistent loop, exactly like the video
         channel switch.
+
+        Half-duplex echo gate: frames are dropped while the speaker track is
+        playing a clip (plus a short tail for playout latency). The Go2's mic
+        picks up its own speaker loudly enough to trigger the STT voice gate,
+        so without this the robot transcribes its own TTS and answers itself.
         """
         subject: Subject[SerializableAudioFrame] = Subject()
 
         async def accept_frame(frame) -> None:  # type: ignore[no-untyped-def]
+            speaker = self._speaker_track
+            if speaker is not None and speaker.recently_active(_ECHO_GATE_TAIL_SECONDS):
+                return
             subject.on_next(SerializableAudioFrame.from_av_frame(frame))
 
         self.conn.audio.add_track_callback(accept_frame)

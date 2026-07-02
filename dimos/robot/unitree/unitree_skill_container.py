@@ -294,11 +294,26 @@ class UnitreeSkillContainer(Module):
         id_, _ = _UNITREE_COMMANDS[command_name]
 
         try:
-            self._connection.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": id_})
-            return f"'{command_name}' command executed successfully."
+            response = self._connection.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": id_})
         except Exception as e:
             logger.error(f"Failed to execute {command_name}: {e}")
             return "Failed to execute the command."
+
+        # The robot replies with a status code; report rejections honestly
+        # instead of claiming success (e.g. tricks unavailable in the current
+        # motion mode return non-zero and the robot never moves).
+        code = None
+        if isinstance(response, dict):
+            code = (
+                response.get("data", {}).get("header", {}).get("status", {}).get("code")
+            )
+        if code not in (0, None):
+            logger.warning(f"Robot rejected {command_name}: status code {code}")
+            return (
+                f"The robot REJECTED '{command_name}' (status code {code}) and did not "
+                "perform it. It may not be available in the current motion mode."
+            )
+        return f"'{command_name}' command executed successfully."
 
 
 _commands = "\n".join(

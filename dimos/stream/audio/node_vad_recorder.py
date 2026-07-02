@@ -53,12 +53,13 @@ class VoiceActivityRecorder(AbstractAudioTransform):
 
     def __init__(
         self,
-        speech_rms_threshold: float = 0.01,
+        speech_rms_threshold: float = 0.008,
         noise_floor_ratio: float = 2.5,
         silence_duration: float = 0.7,
         min_speech_duration: float = 0.4,
         max_utterance_duration: float = 15.0,
         pre_roll_duration: float = 0.3,
+        level_log_interval: float = 10.0,
     ) -> None:
         """
         Args:
@@ -73,6 +74,9 @@ class VoiceActivityRecorder(AbstractAudioTransform):
                 trailing silence so a noisy room can't buffer forever.
             pre_roll_duration: Audio (s) kept before speech onset so the first
                 word isn't clipped.
+            level_log_interval: Seconds between mic-level diagnostic log lines
+                (peak RMS / noise floor / speech gate), for tuning the gate to a
+                specific room and mic gain from the logs. 0 disables.
         """
         self.speech_rms_threshold = speech_rms_threshold
         self.noise_floor_ratio = noise_floor_ratio
@@ -80,6 +84,7 @@ class VoiceActivityRecorder(AbstractAudioTransform):
         self.min_speech_duration = min_speech_duration
         self.max_utterance_duration = max_utterance_duration
         self.pre_roll_duration = pre_roll_duration
+        self.level_log_interval = level_log_interval
         self.audio_observable: Observable | None = None  # type: ignore[type-arg]
 
     def consume_audio(self, audio_observable: Observable) -> "VoiceActivityRecorder":  # type: ignore[type-arg]
@@ -102,6 +107,8 @@ class VoiceActivityRecorder(AbstractAudioTransform):
                 "pre_roll_samples": 0,
                 "sample_rate": None,
                 "noise_floor": None,  # tracked ambient RMS
+                "peak_rms": 0.0,  # loudest frame since the last level log
+                "last_level_log": time.time(),
             }
 
             def reset_utterance() -> None:
@@ -157,6 +164,21 @@ class VoiceActivityRecorder(AbstractAudioTransform):
                         floor = rms
                     speech_gate = max(self.speech_rms_threshold, floor * self.noise_floor_ratio)
                     is_speech = rms >= speech_gate
+
+                    # Periodic level diagnostics so the gate can be tuned to a
+                    # specific room/mic from the logs alone.
+                    state["peak_rms"] = max(state["peak_rms"], rms)
+                    if (
+                        self.level_log_interval > 0
+                        and time.time() - state["last_level_log"] >= self.level_log_interval
+                    ):
+                        logger.info(
+                            f"Mic level: peak_rms={state['peak_rms']:.4f} "
+                            f"noise_floor={floor:.4f} speech_gate={speech_gate:.4f} "
+                            f"{'RECORDING' if state['recording'] else 'idle'}"
+                        )
+                        state["peak_rms"] = 0.0
+                        state["last_level_log"] = time.time()
 
                     # Track the ambient floor. Always fall fast toward any quieter
                     # frame (so a floor seeded on a loud frame converges down and

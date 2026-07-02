@@ -174,6 +174,22 @@ async def test_recv_reanchors_after_long_stall_instead_of_bursting() -> None:
     assert elapsed >= (frames_after - 1) * FRAME_DURATION
 
 
+async def test_recently_active_gates_during_clip_and_tail() -> None:
+    # Echo-gate support: the mic path drops frames while the speaker is (or
+    # just was) playing, so the robot doesn't transcribe its own TTS.
+    track = RobotSpeakerTrack()
+    assert track.recently_active(0.5) is False  # fresh track: never played
+
+    track.play_pcm(_clip_pcm(2))
+    assert track.recently_active(0.5) is True  # clip queued
+
+    await track.recv()
+    await track.recv()
+    await track.recv()  # clip exhausted -> silence
+    assert track.recently_active(10.0) is True  # still inside the tail
+    assert track.recently_active(0.0) is False  # zero tail: gate lifts at once
+
+
 async def test_recv_raises_once_track_is_stopped() -> None:
     track = RobotSpeakerTrack()
     track.stop()  # MediaStreamTrack.stop() -> readyState "ended"

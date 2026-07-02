@@ -104,6 +104,7 @@ class RobotSpeakerTrack(MediaStreamTrack):
         self._offset = 0  # read position into _pcm, in int16 values
         self._timestamp = 0  # samples sent, monotonic across clips
         self._anchor: float | None = None  # wall-clock time of sample 0
+        self._last_clip_time = 0.0  # monotonic time a clip frame last went out
 
     def play_pcm(self, pcm: np.ndarray) -> None:
         """Make ``pcm`` (from decode_clip_to_pcm) the active clip.
@@ -114,6 +115,19 @@ class RobotSpeakerTrack(MediaStreamTrack):
         """
         self._pcm = pcm if pcm.size else None
         self._offset = 0
+        if self._pcm is not None:
+            self._last_clip_time = time.monotonic()
+
+    def recently_active(self, tail_seconds: float) -> bool:
+        """True while a clip is playing or finished under ``tail_seconds`` ago.
+
+        Used by the mic path to gate out the robot hearing its own speaker
+        (self-echo): the tail covers network + jitter-buffer + playout latency
+        between our last clip frame leaving and the speaker going quiet.
+        """
+        if self._pcm is not None:
+            return True
+        return time.monotonic() - self._last_clip_time < tail_seconds
 
     async def recv(self) -> av.AudioFrame:
         if self.readyState != "live":
@@ -134,6 +148,7 @@ class RobotSpeakerTrack(MediaStreamTrack):
             self._anchor = now - self._timestamp / SAMPLE_RATE
 
         if self._pcm is not None:
+            self._last_clip_time = now
             chunk = self._pcm[self._offset : self._offset + _VALUES_PER_FRAME]
             self._offset += _VALUES_PER_FRAME
             if self._offset >= self._pcm.size:

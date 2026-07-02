@@ -159,7 +159,10 @@ class SpeakSkill(Module):
     def speak(self, text: str, blocking: bool = True) -> str:
         """Speak text out loud through the robot's speakers.
 
-        USE THIS TOOL AS OFTEN AS NEEDED. People can't normally see what you say in text, but can hear what you speak.
+        SPEAK BY DEFAULT: whenever you reply to a person — answering a question,
+        reporting what you see, confirming an action — say it with this tool.
+        People near the robot cannot see your text; if you don't speak, they get
+        no response at all. Do not wait to be asked to use the speaker.
 
         Try to be as concise as possible. Remember that speaking takes time, so get to the point quickly.
 
