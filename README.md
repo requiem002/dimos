@@ -262,14 +262,32 @@ would transcribe every ~20 ms fragment, saturate the CPU, and flood the agent
 with blank/hallucinated turns. `VoiceActivityRecorder`
 (`dimos/stream/audio/node_vad_recorder.py`) sits in front of Whisper on the robot
 branch only: it buffers audio once speech begins (with a short pre-roll) and emits
-**one clip per utterance** after trailing silence. Speech is detected against an
-**adaptive noise floor** (a frame is speech only when it rises a set ratio above
-the tracked ambient level), so it works across rooms and mic gains without a fixed
-threshold. Blank transcriptions are also dropped before reaching `/human_input`.
+**one clip per utterance** after trailing silence. Blank transcriptions are also
+dropped before reaching `/human_input`. Detection is **two-stage**:
 
-The robot's firmware wake-word ("Hey Benben") runs independently — the WebRTC
-audio channel streams the raw mic to DimOS in parallel, so no wake word is needed
-on the DimOS side; just speak and pause.
+1. **Adaptive RMS gate (recall).** A frame opens an utterance when it rises
+   `noise_floor_ratio` (×2.0) above the tracked ambient noise floor, and the
+   utterance *continues* at a lower bar (`continuation_ratio`, ×1.4 —
+   hysteresis). Without hysteresis, only the loudest syllables of distant speech
+   stayed above the gate and utterances were chopped into ~1 s fragments, which
+   Whisper misheard badly.
+2. **Silero neural VAD (precision).** Each candidate utterance is confirmed by
+   the Silero voice-activity model (bundled with `faster-whisper`, no extra
+   dependency, ~ms per clip on CPU) before transcription. Candidates with no
+   detected speech — servo whine, dance thuds, jump impacts — are **dropped**,
+   and confirmed speech is **trimmed** to the detected span so Whisper sees
+   speech, not room noise. This is the same class of neural speech detection
+   commercial voice assistants use. If the model can't load it fails *open*
+   (clips pass through unfiltered).
+
+**About "Hey Benben":** the firmware voice assistant is a separate, closed
+system (its own wake-word engine and near-field tuning on the robot's SoC); its
+models aren't accessible over the SDK/WebRTC surface, and there is no documented
+API to disable it — avoid saying its wake word during operation, since its
+spoken replies ("I'm here") arrive at the mic like any other voice and DimOS
+cannot echo-gate audio it didn't originate. The Silero stage above is the
+open-source equivalent of that technology on the DimOS side; a wake word is
+deliberately not required — just speak and pause.
 
 **Echo gate (half-duplex):** the Go2's mic hears its own speaker loudly enough to
 trip the voice gate, so while the speaker track is playing a clip (plus a ~1 s
@@ -282,8 +300,21 @@ finish, then speak.
 `Mic level: peak_rms=… noise_floor=… speech_gate=…` — every ~10 s. If your
 speech doesn't trigger transcription, compare your spoken `peak_rms` against
 `speech_gate` in the logs and adjust `speech_rms_threshold` / `noise_floor_ratio`
-on `VoiceActivityRecorder` accordingly. STT uses Whisper `base.en` (English-only;
-weights download on first use).
+on `VoiceActivityRecorder` accordingly. The mic is in the robot's head — speak
+from the front, within a couple of meters. STT uses Whisper `base.en`
+(English-only; weights download on first use).
+
+## Speak-by-default (auto-speak)
+
+People next to the robot can't see the agent's text, and LLMs don't reliably
+remember to call the `speak` tool. So `SpeakSkill` subscribes to the agent's
+message stream (`/agent`) and **automatically voices the agent's text replies**,
+including action announcements that accompany tool calls. Turns where the model
+called `speak` itself are skipped, as is text landing within a short cooldown of
+a finished `speak` call (the model's post-speak confirmation chatter, which
+would otherwise be spoken twice). Long dumps are truncated at a sentence
+boundary (~350 chars). Disable with `speak_agent_replies: false` on
+`SpeakSkillConfig`.
 
 ## Config knobs
 
@@ -291,7 +322,9 @@ weights download on first use).
 |---------|-------|--------|
 | `force_local_audio` | `GlobalConfig` | Force both directions to host-local audio (debug override) |
 | `microphone` | `ConnectionConfig` (`dimos/robot/unitree/go2/connection.py`) | Disable the Go2 mic stream while keeping the speaker (`microphone: false`) |
-| `speech_rms_threshold`, `noise_floor_ratio`, `silence_duration`, `min_speech_duration` | `VoiceActivityRecorder` | Tune when speech starts/stops and which blips are ignored |
+| `speech_rms_threshold`, `noise_floor_ratio`, `continuation_ratio`, `silence_duration`, `min_speech_duration` | `VoiceActivityRecorder` | Tune when speech starts/stops and which blips are ignored |
+| `use_neural_vad` | `VoiceActivityRecorder` | Silero confirmation/trimming of each utterance (default on) |
+| `speak_agent_replies` | `SpeakSkillConfig` | Auto-speak the agent's text replies (default on) |
 | `set_volume` skill | `SpeakSkill` | Agent-invocable speaker volume 0–10 (Unitree VUI service, `api_id` 1003) — ask the robot to "speak louder" |
 
 ## Key files
@@ -302,6 +335,32 @@ weights download on first use).
 - `dimos/agents/web_human_input.py` — STT source selection and utterance gating
 - `dimos/stream/audio/node_vad_recorder.py` — voice-activity utterance recorder
 - `dimos/stream/audio/resample.py` — 48 kHz stereo → 16 kHz mono for Whisper
+
+## Field reliability notes (Go2)
+
+Hardening applied for live-demo reliability; useful to know when reading logs:
+
+- **Robot footprint clearing (navigation).** While sitting/dancing/jumping, the
+  lidar can paint the robot's own body and the floor around it into the global
+  costmap. Those phantom obstacles wall the start cell in, after which *every*
+  plan fails with `No path found` (the robot "refuses to move"). The planner now
+  clears occupied cells within the robot's rotation clearance of its own
+  position before each plan (`Cleared N occupied cell(s) under the robot
+  footprint` in the log) and, when A* still fails, logs how blocked the area
+  around the robot is so field logs are actionable.
+- **`follow_person` model warm-up.** The person detector (Moondream VL) and
+  tracker (EdgeTAM) cold-load in minutes on the Jetson — longer than the 120 s
+  skill RPC timeout, so the first follow of every boot used to time out. Both
+  models now load in the background at startup (`Person-follow models ready in
+  …s` in the log); a `follow_person` call arriving before that returns a
+  fast "still loading, try again shortly" instead of hanging.
+- **Planner goal-cancel race.** A goal cancelled concurrently with planning
+  (e.g. "close enough" acceptance) crashed an LCM handler thread with an
+  `AssertionError`; it is now handled gracefully.
+- **LCM decode race at startup.** The first decode of each message type
+  resolves type annotations lazily; two subscriber threads doing it at once
+  could drop a live message with `… not stringified type hint`. The decode path
+  now retries.
 
 
 # Usage

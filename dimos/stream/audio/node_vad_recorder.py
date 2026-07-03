@@ -47,26 +47,50 @@ class VoiceActivityRecorder(AbstractAudioTransform):
     floor * noise_floor_ratio (and a small absolute minimum so a dead-silent room
     doesn't drive the gate to zero).
 
+    The gate has HYSTERESIS: once recording, frames only need to exceed
+    floor * continuation_ratio (< noise_floor_ratio) to count as speech. Without
+    this, only the loudest syllables of distant speech stay above the onset gate
+    and utterances get chopped after ~1s, feeding the transcriber fragments
+    ("Mm-hmm", "He's dead") instead of whole sentences.
+
+    The RMS gate is deliberately permissive; PRECISION comes from a second
+    stage: each candidate utterance is confirmed by the Silero neural VAD
+    (bundled with faster-whisper, no extra dependency) before it is emitted.
+    Non-speech candidates — servo whine, dance thuds, jump impacts — are
+    dropped, and confirmed speech is trimmed to the detected span (plus
+    padding) so the transcriber sees speech, not room noise. This is the same
+    class of technology commercial voice assistants use for speech detection.
+    If the neural VAD is unavailable it fails OPEN (utterances pass through).
+
     Timing (silence, min/max length) is measured in AUDIO time via sample counts,
     not wall clock, so behaviour is independent of how fast frames arrive.
     """
 
+    # Silero is trained on 8/16 kHz; our robot-mic STT path resamples to 16 kHz
+    # before this node. Confirmation is skipped at any other rate.
+    _NEURAL_VAD_SAMPLE_RATE = 16000
+
     def __init__(
         self,
         speech_rms_threshold: float = 0.008,
-        noise_floor_ratio: float = 2.5,
+        noise_floor_ratio: float = 2.0,
+        continuation_ratio: float = 1.4,
         silence_duration: float = 0.7,
         min_speech_duration: float = 0.4,
         max_utterance_duration: float = 15.0,
         pre_roll_duration: float = 0.3,
         level_log_interval: float = 10.0,
+        use_neural_vad: bool = True,
     ) -> None:
         """
         Args:
             speech_rms_threshold: Absolute minimum RMS (0..1) for the speech gate,
                 so a dead-silent room doesn't drive the adaptive gate to zero.
-            noise_floor_ratio: A frame counts as speech when its RMS exceeds the
-                tracked ambient noise floor times this ratio.
+            noise_floor_ratio: A frame counts as speech ONSET when its RMS exceeds
+                the tracked ambient noise floor times this ratio.
+            continuation_ratio: While already recording, a frame counts as speech
+                when it exceeds floor times this (lower) ratio — hysteresis so
+                quieter syllables don't end the utterance early.
             silence_duration: Trailing silence (s of audio) that ends an utterance.
             min_speech_duration: Utterances with less than this much speech (s) are
                 discarded as blips, so coughs/clicks don't reach the transcriber.
@@ -77,15 +101,56 @@ class VoiceActivityRecorder(AbstractAudioTransform):
             level_log_interval: Seconds between mic-level diagnostic log lines
                 (peak RMS / noise floor / speech gate), for tuning the gate to a
                 specific room and mic gain from the logs. 0 disables.
+            use_neural_vad: Confirm each candidate utterance with the Silero
+                neural VAD and trim it to the detected speech span. Candidates
+                with no detected speech are dropped.
         """
         self.speech_rms_threshold = speech_rms_threshold
         self.noise_floor_ratio = noise_floor_ratio
+        self.continuation_ratio = continuation_ratio
         self.silence_duration = silence_duration
         self.min_speech_duration = min_speech_duration
         self.max_utterance_duration = max_utterance_duration
         self.pre_roll_duration = pre_roll_duration
         self.level_log_interval = level_log_interval
+        self.use_neural_vad = use_neural_vad
+        self._neural_vad_broken = False
         self.audio_observable: Observable | None = None  # type: ignore[type-arg]
+
+    def _speech_spans(self, audio: np.ndarray, sample_rate: int) -> list[tuple[int, int]] | None:
+        """Run the Silero neural VAD over a candidate utterance.
+
+        Returns a list of (start, end) sample spans of detected speech (already
+        padded), an empty list when the clip contains no speech, or None when
+        confirmation is unavailable (disabled, wrong sample rate, or the VAD
+        failed to load) — in which case the caller emits the clip unfiltered.
+        """
+        if (
+            not self.use_neural_vad
+            or self._neural_vad_broken
+            or sample_rate != self._NEURAL_VAD_SAMPLE_RATE
+        ):
+            return None
+        try:
+            # Bundled with faster-whisper (already a dimos dependency); the
+            # small ONNX model loads once (~2 MB) and runs in milliseconds.
+            from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+            options = VadOptions(
+                threshold=0.5,
+                min_speech_duration_ms=200,
+                min_silence_duration_ms=500,
+                speech_pad_ms=300,
+            )
+            timestamps = get_speech_timestamps(
+                audio.astype(np.float32, copy=False), options, sampling_rate=sample_rate
+            )
+            return [(int(t["start"]), int(t["end"])) for t in timestamps]
+        except Exception as e:
+            # Fail OPEN: better to transcribe some noise than to go deaf.
+            logger.error(f"Neural VAD unavailable, emitting utterances unfiltered: {e}")
+            self._neural_vad_broken = True
+            return None
 
     def consume_audio(self, audio_observable: Observable) -> "VoiceActivityRecorder":  # type: ignore[type-arg]
         self.audio_observable = audio_observable
@@ -134,7 +199,22 @@ class VoiceActivityRecorder(AbstractAudioTransform):
                     )
                     return
                 combined = np.concatenate(buffer, axis=0)
-                logger.info(f"Emitting {total / sample_rate:.2f}s utterance for transcription")
+
+                spans = self._speech_spans(combined, sample_rate)
+                if spans is not None:
+                    if not spans:
+                        logger.info(
+                            f"Dropping {total / sample_rate:.2f}s candidate: "
+                            "neural VAD found no speech (motion/ambient noise)"
+                        )
+                        return
+                    # Trim to the detected speech (spans are already padded) so
+                    # the transcriber isn't fed leading/trailing room noise.
+                    combined = combined[spans[0][0] : spans[-1][1]]
+
+                logger.info(
+                    f"Emitting {combined.shape[0] / sample_rate:.2f}s utterance for transcription"
+                )
                 observer.on_next(
                     AudioEvent(
                         data=combined,
@@ -162,7 +242,10 @@ class VoiceActivityRecorder(AbstractAudioTransform):
                     floor = state["noise_floor"]
                     if floor is None:
                         floor = rms
-                    speech_gate = max(self.speech_rms_threshold, floor * self.noise_floor_ratio)
+                    # Hysteresis: a lower bar keeps an utterance going than the
+                    # one that starts it (see class docstring).
+                    ratio = self.continuation_ratio if state["recording"] else self.noise_floor_ratio
+                    speech_gate = max(self.speech_rms_threshold, floor * ratio)
                     is_speech = rms >= speech_gate
 
                     # Periodic level diagnostics so the gate can be tuned to a
@@ -237,7 +320,8 @@ class VoiceActivityRecorder(AbstractAudioTransform):
 
             logger.info(
                 "Started voice-activity recorder "
-                f"(threshold={self.speech_rms_threshold}, silence={self.silence_duration}s)"
+                f"(threshold={self.speech_rms_threshold}, silence={self.silence_duration}s, "
+                f"neural_vad={'on' if self.use_neural_vad else 'off'})"
             )
 
             return disposable.Disposable(subscription.dispose)

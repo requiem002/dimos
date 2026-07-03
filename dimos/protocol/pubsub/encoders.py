@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import pickle
+import time
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar, cast
 
 from dimos.msgs.protocol import DimosMsg
@@ -112,4 +113,19 @@ class LCMEncoderMixin(PubSubEncoderMixin[LCMTopicProto, DimosMsg, bytes]):
     def decode(self, msg: bytes, topic: LCMTopicProto) -> DimosMsg:
         if topic.lcm_type is None:
             raise DecodingError(f"Cannot decode: topic {topic.topic!r} has no lcm_type")
-        return topic.lcm_type.lcm_decode(msg)
+        try:
+            return topic.lcm_type.lcm_decode(msg)
+        except AssertionError:
+            # plum/beartype PEP-563 race: the FIRST decode of a message type
+            # resolves its stringified annotations by mutating the function's
+            # __annotations__ in place. Two LCM threads first-decoding the same
+            # type concurrently can interleave, and the loser dies with
+            # "... not stringified type hint" — dropping a live message at
+            # startup. Resolution is idempotent, so retry briefly.
+            for _ in range(3):
+                time.sleep(0.02)
+                try:
+                    return topic.lcm_type.lcm_decode(msg)
+                except AssertionError:
+                    continue
+            raise

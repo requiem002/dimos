@@ -76,6 +76,8 @@ class PersonFollowSkillContainer(Module):
         self._thread: Thread | None = None
         self._should_stop: Event = Event()
         self._lock = RLock()
+        self._models_ready: Event = Event()
+        self._warmup_thread: Thread | None = None
 
         # Use simulator camera intrinsics in simulation mode
         camera_info = self.config.camera_info
@@ -97,10 +99,45 @@ class PersonFollowSkillContainer(Module):
         self.register_disposable(Disposable(self.color_image.subscribe(self._on_color_image)))
         if self.config.use_3d_navigation:
             self.register_disposable(Disposable(self.global_map.subscribe(self._on_pointcloud)))
+        # Load the detection/tracking models NOW, in the background, instead of
+        # on the first follow_person call. A cold Moondream load + compile takes
+        # minutes on the Jetson, longer than the 120s skill RPC timeout — so
+        # without this warm-up the first follow of every boot always timed out.
+        self._warmup_thread = Thread(
+            target=self._warm_models, daemon=True, name="PersonFollow-warmup"
+        )
+        self._warmup_thread.start()
+
+    def _warm_models(self) -> None:
+        try:
+            started = time.monotonic()
+            logger.info("Warming person-follow models (Moondream VL + EdgeTAM)...")
+            with self._lock:
+                if self._tracker is None:
+                    self._tracker = EdgeTAMProcessor()
+            # A tiny dummy query forces the weight load AND the first-inference
+            # torch.compile, which dominate cold-start latency.
+            dummy = Image(data=np.zeros((64, 64, 3), dtype=np.uint8), format=ImageFormat.RGB)
+            self._vl_model.query(dummy, "Reply with the word OK.")
+            logger.info(
+                f"Person-follow models ready in {time.monotonic() - started:.0f}s; "
+                "follow_person is now available"
+            )
+        except Exception as e:
+            logger.error(f"Person-follow model warm-up failed: {e}")
+        finally:
+            # Never leave follow_person permanently gated: if warm-up failed,
+            # the first real call will surface the same error to the agent.
+            self._models_ready.set()
 
     @rpc
     def stop(self) -> None:
         self._stop_following()
+
+        warmup = self._warmup_thread
+        if warmup is not None:
+            warmup.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            self._warmup_thread = None
 
         thread = self._thread
         if thread is not None:
@@ -143,6 +180,14 @@ class PersonFollowSkillContainer(Module):
             follow_person("man with blue shirt")
             follow_person("person in the doorway")
         """
+
+        if not self._models_ready.is_set():
+            # Fail fast instead of blocking into the RPC timeout while the
+            # models finish their cold start (see _warm_models).
+            return (
+                "The person-detection models are still loading (first minutes after "
+                "startup). Try again shortly."
+            )
 
         self._stop_following()
 

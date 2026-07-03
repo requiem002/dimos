@@ -40,6 +40,10 @@ def _frame(rms_level: float) -> AudioEvent:
 
 
 def _run(frames: list[AudioEvent], **kwargs) -> list[AudioEvent]:
+    # The synthetic constant-value frames used here exercise the RMS state
+    # machine; the Silero stage would (correctly) reject them as non-speech,
+    # so it is disabled except in the dedicated neural-stage tests below.
+    kwargs.setdefault("use_neural_vad", False)
     recorder = VoiceActivityRecorder(**kwargs)
     recorder.consume_audio(rx.of(*frames))
     out: list[AudioEvent] = []
@@ -110,3 +114,61 @@ def test_pre_roll_prepends_audio_before_onset() -> None:
     out = _run(frames, silence_duration=0.5, min_speech_duration=0.4)
     assert len(out) == 1
     assert out[0].data.shape[0] >= 50 * FRAME
+
+
+def test_hysteresis_keeps_quiet_continuation() -> None:
+    # Ambient 0.03 -> onset gate 0.06 (ratio 2.0), continuation gate 0.042
+    # (ratio 1.4). Speech onsets loud (0.2) then continues quietly at 0.05:
+    # above the continuation gate but below the onset gate. Without hysteresis
+    # the quiet part would be counted as trailing silence and the utterance
+    # chopped after the loud syllable (the run-1 "fragments" failure).
+    frames = (
+        _silence_at(0.03, 30)
+        + _speech(10, level=0.2)
+        + _speech(30, level=0.05)
+        + _silence_at(0.03, 40)
+    )
+    out = _run(frames, silence_duration=0.5, min_speech_duration=0.4)
+    assert len(out) == 1
+    assert out[0].data.shape[0] >= 40 * FRAME  # loud onset + quiet continuation
+
+
+def test_neural_vad_drops_constant_nonspeech() -> None:
+    # With the real Silero stage enabled, a constant-value burst (RMS-loud but
+    # spectrally nothing like speech, e.g. servo hum) must be dropped.
+    frames = _silence(5) + _speech(50) + _silence(40)
+    out = _run(frames, silence_duration=0.5, min_speech_duration=0.4, use_neural_vad=True)
+    assert out == []
+
+
+def test_neural_vad_trims_to_detected_span() -> None:
+    recorder = VoiceActivityRecorder(silence_duration=0.5, min_speech_duration=0.4)
+    recorder._speech_spans = lambda audio, sr: [(1000, 5000)]  # type: ignore[method-assign]
+    frames = _silence(5) + _speech(50) + _silence(40)
+    recorder.consume_audio(rx.of(*frames))
+    out: list[AudioEvent] = []
+    recorder.emit_recording().subscribe(on_next=out.append)
+    assert len(out) == 1
+    assert out[0].data.shape[0] == 4000
+
+
+def test_neural_vad_fails_open_when_unavailable() -> None:
+    # None means "confirmation unavailable" -> the utterance passes through.
+    recorder = VoiceActivityRecorder(silence_duration=0.5, min_speech_duration=0.4)
+    recorder._speech_spans = lambda audio, sr: None  # type: ignore[method-assign]
+    frames = _silence(5) + _speech(50) + _silence(40)
+    recorder.consume_audio(rx.of(*frames))
+    out: list[AudioEvent] = []
+    recorder.emit_recording().subscribe(on_next=out.append)
+    assert len(out) == 1
+    assert out[0].data.shape[0] >= 50 * FRAME
+
+
+def test_speech_spans_skips_non_16k_audio() -> None:
+    recorder = VoiceActivityRecorder()
+    assert recorder._speech_spans(np.zeros(48000, dtype=np.float32), 48000) is None
+
+
+def test_speech_spans_empty_on_silence() -> None:
+    recorder = VoiceActivityRecorder()
+    assert recorder._speech_spans(np.zeros(32000, dtype=np.float32), 16000) == []

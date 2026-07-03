@@ -15,6 +15,7 @@
 import numpy as np
 from scipy import ndimage
 
+from dimos.msgs.geometry_msgs.Vector3 import VectorLike
 from dimos.msgs.nav_msgs.OccupancyGrid import CostValues, OccupancyGrid
 
 
@@ -55,6 +56,53 @@ def smooth_occupied(
         origin=occupancy_grid.origin,
         frame_id=occupancy_grid.frame_id,
         ts=occupancy_grid.ts,
+    )
+
+
+def clear_disc(
+    occupancy_grid: OccupancyGrid, center: VectorLike, radius: float
+) -> tuple[OccupancyGrid, int]:
+    """Mark every cell within ``radius`` (meters) of ``center`` (world coords) as FREE.
+
+    Used to clear the robot's own footprint before path planning: the robot is
+    physically standing there, so that space is traversable by definition. Lidar
+    self-hits (the sensor painting the robot's own body or the floor during
+    sit/dance/jump poses) otherwise leave occupied cells under and around the
+    robot which, once inflated, wall the start cell in and make every plan fail
+    with "No path found".
+
+    Args:
+        occupancy_grid: Input occupancy grid (not modified)
+        center: World position of the disc center
+        radius: Disc radius in meters
+    Returns:
+        Tuple of (new OccupancyGrid with the disc cleared, number of previously
+        occupied cells that were cleared — useful for diagnostics).
+    """
+    grid_array = occupancy_grid.grid
+    if grid_array.size == 0:
+        return occupancy_grid, 0
+
+    center_cell = occupancy_grid.world_to_grid(center)
+    cell_radius = radius / occupancy_grid.resolution
+
+    height, width = grid_array.shape
+    y, x = np.ogrid[:height, :width]
+    disc = (x - center_cell.x) ** 2 + (y - center_cell.y) ** 2 <= cell_radius**2
+
+    cleared = int(np.sum(grid_array[disc] >= CostValues.OCCUPIED))
+    result_grid = grid_array.copy()
+    result_grid[disc] = CostValues.FREE
+
+    return (
+        OccupancyGrid(
+            grid=result_grid,
+            resolution=occupancy_grid.resolution,
+            origin=occupancy_grid.origin,
+            frame_id=occupancy_grid.frame_id,
+            ts=occupancy_grid.ts,
+        ),
+        cleared,
     )
 
 

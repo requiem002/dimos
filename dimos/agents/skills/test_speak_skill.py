@@ -139,3 +139,93 @@ def test_connection_dependency_is_optional_spec_ref() -> None:
     conn_refs = [r for r in atom.module_refs if getattr(r, "spec", None) is GO2ConnectionSpec]
     assert len(conn_refs) == 1
     assert conn_refs[0].optional is True
+
+
+# ---------------------------------------------------------------------------
+# Auto-speak of agent replies (speak-by-default without relying on the LLM)
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from dimos.agents.skills.speak_skill import (
+    _AUTO_SPEAK_MAX_CHARS,
+    _message_text,
+    _truncate_for_speech,
+)
+
+
+def _make_autospeak_skill() -> tuple[SpeakSkill, list[str]]:
+    skill = SpeakSkill.__new__(SpeakSkill)
+    skill._last_tool_speak_end = 0.0
+    spoken: list[str] = []
+    skill._auto_speak_bg = spoken.append  # type: ignore[method-assign]
+    return skill, spoken
+
+
+def test_auto_speak_voices_plain_ai_reply() -> None:
+    skill, spoken = _make_autospeak_skill()
+    skill._on_agent_message(AIMessage(content="I am standing up."))
+    assert spoken == ["I am standing up."]
+
+
+def test_auto_speak_ignores_non_ai_messages() -> None:
+    skill, spoken = _make_autospeak_skill()
+    skill._on_agent_message(HumanMessage(content="stand up"))
+    assert spoken == []
+
+
+def test_auto_speak_skips_empty_ai_message() -> None:
+    skill, spoken = _make_autospeak_skill()
+    skill._on_agent_message(AIMessage(content=""))
+    assert spoken == []
+
+
+def test_auto_speak_skips_turns_where_model_called_speak_itself() -> None:
+    skill, spoken = _make_autospeak_skill()
+    msg = AIMessage(
+        content="I'll say hello.",
+        tool_calls=[{"name": "speak", "args": {"text": "hello"}, "id": "1"}],
+    )
+    skill._on_agent_message(msg)
+    assert spoken == []
+
+
+def test_auto_speak_voices_action_announcements() -> None:
+    skill, spoken = _make_autospeak_skill()
+    msg = AIMessage(
+        content="I'll perform a dance for you now.",
+        tool_calls=[{"name": "execute_sport_command", "args": {}, "id": "1"}],
+    )
+    skill._on_agent_message(msg)
+    assert spoken == ["I'll perform a dance for you now."]
+
+
+def test_auto_speak_cooldown_suppresses_post_speak_confirmation() -> None:
+    skill, spoken = _make_autospeak_skill()
+    skill._last_tool_speak_end = _time.monotonic()  # a speak call just finished
+    skill._on_agent_message(AIMessage(content="I've introduced myself through my speakers."))
+    assert spoken == []
+
+
+def test_message_text_joins_text_blocks() -> None:
+    msg = AIMessage(
+        content=[
+            {"type": "text", "text": "part one"},
+            {"type": "tool_use", "id": "x", "name": "observe", "input": {}},
+            {"type": "text", "text": "part two"},
+        ]
+    )
+    assert _message_text(msg) == "part one part two"
+
+
+def test_truncate_for_speech_prefers_sentence_boundary() -> None:
+    text = "This is a sentence. " * 100
+    result = _truncate_for_speech(text)
+    assert len(result) <= _AUTO_SPEAK_MAX_CHARS
+    assert result.endswith(".")
+
+
+def test_truncate_for_speech_leaves_short_text_alone() -> None:
+    assert _truncate_for_speech("Short reply.") == "Short reply."

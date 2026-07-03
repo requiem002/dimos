@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 
+from langchain_core.messages import BaseMessage
 from pydantic import Field
 from reactivex import Subject
 import soundfile as sf  # type: ignore[import-untyped]
@@ -25,6 +26,7 @@ from dimos.agents.annotation import skill
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
+from dimos.core.stream import In
 from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec, use_robot_audio
 from dimos.stream.audio.node_output import SounddeviceAudioOutput
 from dimos.stream.audio.tts.node_openai import OpenAITTSNode, Voice
@@ -51,12 +53,57 @@ def _robot_playback_wait(clip_duration: float) -> float:
     return clip_duration * _ROBOT_PLAYBACK_MARGIN_FACTOR + _ROBOT_PLAYBACK_MARGIN_SECONDS
 
 
+# Auto-speak: skip an agent text reply that lands this soon after a speak-tool
+# call finished — it is the model's post-speak confirmation ("I've introduced
+# myself through my speakers."), already voiced by the tool call itself.
+_AUTO_SPEAK_COOLDOWN_SECONDS = 3.0
+# Auto-speak: cap so a long text dump (module lists, etc.) can't hold the
+# speaker for a minute.
+_AUTO_SPEAK_MAX_CHARS = 350
+
+
+def _message_text(msg: BaseMessage) -> str:
+    """Plain text of a langchain message (content may be a string or a list of
+    typed blocks)."""
+    content = msg.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+def _truncate_for_speech(text: str, max_chars: int = _AUTO_SPEAK_MAX_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    # Prefer ending on a sentence boundary.
+    for sep in (". ", "! ", "? "):
+        idx = cut.rfind(sep)
+        if idx > max_chars // 2:
+            return cut[: idx + 1]
+    return cut + "…"
+
+
 class SpeakSkillConfig(ModuleConfig):
     force_local_audio: bool = Field(default_factory=lambda m: m["g"].force_local_audio)
+    # Voice the agent's text replies automatically. The system prompt asks the
+    # model to use the speak tool, but models don't do so reliably; people next
+    # to the robot get no response at all when it "answers" in text only. This
+    # makes speaking the default deterministically rather than by LLM goodwill.
+    speak_agent_replies: bool = True
 
 
 class SpeakSkill(Module):
     config: SpeakSkillConfig
+
+    # Every message flowing through the agent (human/ai/tool), published by
+    # McpClient; used to auto-speak the agent's text replies.
+    agent: In[BaseMessage]
 
     _tts_node: OpenAITTSNode | None = None
     _audio_output: SounddeviceAudioOutput | None = None
@@ -69,6 +116,8 @@ class SpeakSkill(Module):
     _robot_clip_duration: float = 0.0
     _speak_through_robot: bool = False
     _text_subject: Subject[str] | None = None
+    _agent_unsub = None
+    _last_tool_speak_end: float = 0.0
 
     @staticmethod
     def _should_use_robot_speaker(connection: object | None, force_local_audio: bool) -> bool:
@@ -99,12 +148,72 @@ class SpeakSkill(Module):
             self._audio_output = SounddeviceAudioOutput(sample_rate=24000)
             self._audio_output.consume_audio(self._tts_node.emit_audio())
 
+        if self.config.speak_agent_replies:
+            try:
+                self._agent_unsub = self.agent.subscribe(self._on_agent_message)
+                logger.info("Auto-speak of agent text replies enabled")
+            except Exception as e:
+                logger.warning(f"Auto-speak disabled (no agent message stream wired): {e}")
+
+    def _on_agent_message(self, msg: BaseMessage) -> None:
+        """Voice the agent's text replies so speaking never depends on the LLM
+        remembering to call the speak tool.
+
+        Speaks AI messages with text content, including action announcements
+        that accompany tool calls. Skipped: turns where the model called the
+        speak tool itself (that call voices the turn), and text landing within
+        a short cooldown of a finished speak-tool call (post-speak confirmation
+        chatter, which would be spoken twice otherwise).
+        """
+        try:
+            if getattr(msg, "type", None) != "ai":
+                return
+            for tool_call in getattr(msg, "tool_calls", None) or []:
+                name = (
+                    tool_call.get("name")
+                    if isinstance(tool_call, dict)
+                    else getattr(tool_call, "name", None)
+                )
+                if name == "speak":
+                    return
+            text = _message_text(msg).strip()
+            if not text:
+                return
+            if time.monotonic() - self._last_tool_speak_end < _AUTO_SPEAK_COOLDOWN_SECONDS:
+                return
+            self._auto_speak_bg(_truncate_for_speech(text))
+        except Exception as e:
+            logger.error(f"Auto-speak failed: {e}")
+
+    def _auto_speak_bg(self, text: str) -> None:
+        # Same background-thread bookkeeping as speak(blocking=False), but
+        # without touching _last_tool_speak_end: the cooldown must only track
+        # the LLM's own speak-tool calls, not auto-spoken replies.
+        thread = threading.Thread(
+            target=self._speak_bg_no_mark, args=(text,), daemon=True, name="SpeakSkill-auto"
+        )
+        with self._bg_threads_lock:
+            self._bg_threads.append(thread)
+        thread.start()
+
+    def _speak_bg_no_mark(self, text: str) -> None:
+        try:
+            self._speak_blocking(text)
+        finally:
+            with self._bg_threads_lock:
+                self._bg_threads = [
+                    t for t in self._bg_threads if t is not threading.current_thread()
+                ]
+
     @rpc
     def stop(self) -> None:
         with self._bg_threads_lock:
             threads = list(self._bg_threads)
         for t in threads:
             t.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        if self._agent_unsub is not None:
+            self._agent_unsub()
+            self._agent_unsub = None
         if self._robot_audio_sub is not None:
             self._robot_audio_sub.dispose()
             self._robot_audio_sub = None
@@ -182,7 +291,11 @@ class SpeakSkill(Module):
             thread.start()
             return f"Speaking (non-blocking): {text}"
 
-        return self._speak_blocking(text)
+        result = self._speak_blocking(text)
+        # Marks the end of an LLM-initiated speak so auto-speak can suppress the
+        # model's post-speak confirmation text (see _on_agent_message).
+        self._last_tool_speak_end = time.monotonic()
+        return result
 
     @skill
     def set_volume(self, level: int) -> str:
@@ -202,6 +315,7 @@ class SpeakSkill(Module):
     def _speak_bg(self, text: str) -> None:
         try:
             self._speak_blocking(text)
+            self._last_tool_speak_end = time.monotonic()
         finally:
             # Remove this thread from the list of background threads when done
             with self._bg_threads_lock:
