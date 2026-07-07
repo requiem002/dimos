@@ -280,14 +280,25 @@ dropped before reaching `/human_input`. Detection is **two-stage**:
    commercial voice assistants use. If the model can't load it fails *open*
    (clips pass through unfiltered).
 
+**Wake word (robot mic only).** Utterances transcribed from the robot's mic
+must start with the wake phrase (`wake_word`, default **"hey robot"**) to reach
+the agent; everything else the mic hears is dropped with an
+`Ignored (no wake word): "..."` log line. This keeps ambient conversation in the
+room from becoming prompts. Matching is tolerant of STT noise (casing,
+punctuation, "hey"/"hi"/"a" fillers, close mishearings like "robots"/"Robert"),
+and the phrase is stripped before the command reaches the agent — say
+*"hey robot, walk forward"*. Browser push-to-talk audio and typed text are
+deliberate, so they bypass the gate. Set `wake_word: ""` to disable, or
+`voice_input: false` to turn spoken input off entirely (typed text and the
+speaker keep working).
+
 **About "Hey Benben":** the firmware voice assistant is a separate, closed
 system (its own wake-word engine and near-field tuning on the robot's SoC); its
 models aren't accessible over the SDK/WebRTC surface, and there is no documented
 API to disable it — avoid saying its wake word during operation, since its
 spoken replies ("I'm here") arrive at the mic like any other voice and DimOS
-cannot echo-gate audio it didn't originate. The Silero stage above is the
-open-source equivalent of that technology on the DimOS side; a wake word is
-deliberately not required — just speak and pause.
+cannot echo-gate audio it didn't originate. The Silero stage and wake-word gate
+above are the open-source equivalent of that technology on the DimOS side.
 
 **Echo gate (half-duplex):** the Go2's mic hears its own speaker loudly enough to
 trip the voice gate, so while the speaker track is playing a clip (plus a ~1 s
@@ -301,8 +312,9 @@ finish, then speak.
 speech doesn't trigger transcription, compare your spoken `peak_rms` against
 `speech_gate` in the logs and adjust `speech_rms_threshold` / `noise_floor_ratio`
 on `VoiceActivityRecorder` accordingly. The mic is in the robot's head — speak
-from the front, within a couple of meters. STT uses Whisper `base.en`
-(English-only; weights download on first use).
+from the front, within a couple of meters. STT uses Whisper (English-only `.en`
+models; weights download on first use): `small.en` when a CUDA GPU is available,
+`base.en` on CPU, overridable with `whisper_model`.
 
 ## Speak-by-default (auto-speak)
 
@@ -316,10 +328,24 @@ would otherwise be spoken twice). Long dumps are truncated at a sentence
 boundary (~350 chars). Disable with `speak_agent_replies: false` on
 `SpeakSkillConfig`.
 
+## Running on a desktop vs. an embedded host
+
+Nothing in the voice feature is tied to the Jetson or aarch64 — it runs
+unmodified on any Linux x86_64 machine that can reach the robot's network.
+Model device selection is automatic (`"cuda" if torch.cuda.is_available() else
+"cpu"`), so a desktop with a working NVIDIA driver is strictly *better*: Whisper
+auto-upgrades to `small.en` (markedly more accurate STT), and GPU inference
+makes the Moondream/EdgeTAM person-following models load and run fast enough to
+be practical. On CPU-only hosts everything still works — Whisper drops to
+`base.en` and `follow_person` warms its models in the background at startup.
+
 ## Config knobs
 
 | Setting | Where | Effect |
 |---------|-------|--------|
+| `voice_input` | `GlobalConfig` | Master switch for spoken input; `false` = no STT at all, typed text and speaker unaffected (default on) |
+| `wake_word` | `GlobalConfig` | Phrase robot-mic utterances must start with (default `"hey robot"`; `""` disables the gate) |
+| `whisper_model` | `GlobalConfig` | Whisper STT model; `""` = auto (`small.en` on CUDA, `base.en` on CPU) |
 | `force_local_audio` | `GlobalConfig` | Force both directions to host-local audio (debug override) |
 | `microphone` | `ConnectionConfig` (`dimos/robot/unitree/go2/connection.py`) | Disable the Go2 mic stream while keeping the speaker (`microphone: false`) |
 | `speech_rms_threshold`, `noise_floor_ratio`, `continuation_ratio`, `silence_duration`, `min_speech_duration` | `VoiceActivityRecorder` | Tune when speech starts/stops and which blips are ignored |

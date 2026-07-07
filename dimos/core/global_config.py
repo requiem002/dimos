@@ -74,6 +74,18 @@ class GlobalConfig(BaseSettings):
     # falling back to local audio only when there is no connection. This flag is
     # only a debug/override escape hatch, not the on/off switch for the feature.
     force_local_audio: bool = False
+    # Master switch for spoken input. When False, WebInput never wires any audio
+    # source into speech-to-text (no Whisper, no mic subscription); typed text in
+    # the web UI still works and the speaker output is unaffected.
+    voice_input: bool = True
+    # Utterances transcribed from the ROBOT's onboard mic must start with this
+    # phrase to reach the agent; everything else the mic hears is dropped. Keeps
+    # ambient conversation from becoming prompts. Empty string disables the gate.
+    # Browser push-to-talk audio and typed text are deliberate, so never gated.
+    wake_word: str = "hey robot"
+    # Whisper STT model name. Empty string = auto: "small.en" when CUDA is
+    # available (markedly more accurate, fast on GPU), else "base.en" (CPU-safe).
+    whisper_model: str = ""
     detection_model: VlModelName = "moondream"
     listen_host: str = "127.0.0.1"
     dimsim_scene: str = "apt"

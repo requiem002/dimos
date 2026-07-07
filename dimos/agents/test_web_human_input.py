@@ -29,16 +29,16 @@ from types import SimpleNamespace
 import pytest
 import reactivex as rx
 
-from dimos.agents.web_human_input import WebInput
+from dimos.agents.web_human_input import WebInput, _select_whisper_model, strip_wake_word
 from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec, use_robot_audio
 
 
 @pytest.mark.parametrize(
     "connection, force_local, expected",
     [
-        (object(), False, True),   # connection present, default -> robot mic
-        (None, False, False),      # no connection -> browser fallback
-        (object(), True, False),   # explicit force-local override
+        (object(), False, True),  # connection present, default -> robot mic
+        (None, False, False),  # no connection -> browser fallback
+        (object(), True, False),  # explicit force-local override
         (None, True, False),
     ],
 )
@@ -101,3 +101,76 @@ def test_mic_audio_is_declared_in_stream() -> None:
     mic_streams = [s for s in atom.streams if s.name == "mic_audio"]
     assert len(mic_streams) == 1
     assert mic_streams[0].type is AudioEvent
+
+
+# --- Wake-word gate ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("hey robot walk forward", "walk forward"),
+        ("Hey, Robot, come here.", "come here."),
+        ("Hey robots, sit down", "sit down"),  # plural mishearing
+        ("A robot do a dance", "do a dance"),  # clipped "hey"
+        ("Hi robot spin around", "spin around"),
+        ("Hey Robert, stand up", "stand up"),  # close mishearing of "robot"
+    ],
+)
+def test_strip_wake_word_accepts_variants(text: str, expected: str) -> None:
+    assert strip_wake_word(text, "hey robot") == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "walk forward",  # no wake word at all
+        "the robot should walk",  # wake word not at the start
+        "hey rabbit walk forward",  # second token too dissimilar
+        "hey robot",  # wake word alone, no command
+        "Hey, robot.",  # wake word alone with punctuation
+        "hey",  # shorter than the wake phrase
+        "",
+    ],
+)
+def test_strip_wake_word_rejects(text: str) -> None:
+    assert strip_wake_word(text, "hey robot") is None
+
+
+def test_strip_wake_word_disabled_passes_through_unchanged() -> None:
+    assert strip_wake_word("Anything at all.", "") == "Anything at all."
+
+
+def test_gate_transcript_strips_or_drops() -> None:
+    wi = WebInput.__new__(WebInput)
+    wi.config = SimpleNamespace(wake_word="hey robot")  # type: ignore[assignment]
+    assert wi._gate_transcript("hey robot sit down") == "sit down"
+    assert wi._gate_transcript("ambient chatter about robots") is None
+
+
+# --- Whisper model selection ------------------------------------------------
+
+
+def test_select_whisper_model_explicit_config_wins() -> None:
+    assert _select_whisper_model("base.en") == "base.en"
+    assert _select_whisper_model("large-v3") == "large-v3"
+
+
+def test_select_whisper_model_auto_matches_device() -> None:
+    import torch
+
+    expected = "small.en" if torch.cuda.is_available() else "base.en"
+    assert _select_whisper_model("") == expected
+
+
+# --- Voice-input kill-switch and config plumbing ------------------------------
+
+
+def test_global_config_voice_defaults() -> None:
+    from dimos.core.global_config import GlobalConfig
+
+    config = GlobalConfig()
+    assert config.voice_input is True
+    assert config.wake_word == "hey robot"
+    assert config.whisper_model == ""
+    assert config.force_local_audio is False
