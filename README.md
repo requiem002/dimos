@@ -216,6 +216,149 @@ dimos stop                                # Shut down
 > Full CLI reference: [docs/usage/cli.md](docs/usage/cli.md)
 
 
+# Robot Voice I/O (Go2 speaker + microphone)
+
+On a Unitree Go2 the agent talks and listens through the **robot's own speaker
+and microphone**, not the host machine's audio devices. Both directions ride the
+**single, already-negotiated WebRTC connection** — no second connection is opened
+and no SDP renegotiation happens (the Go2 tolerates one connection per boot).
+
+| Direction | Path |
+|-----------|------|
+| **Speak (TTS out)** | `speak` skill → OpenAI TTS → `RobotSpeakerTrack` swapped onto the pre-negotiated audio sender with `replaceTrack` → Go2 speaker |
+| **Listen (STT in)** | Go2 mic → `GO2Connection.audio_stream` (48 kHz stereo `AudioEvent`) → `WebInput` resamples to 16 kHz mono → voice-activity gate → Whisper → `/human_input` |
+
+## How it decides: robot vs. local
+
+One shared rule governs both directions, so the speaker and mic always stay in
+lock-step (`use_robot_audio` in `dimos/robot/unitree/go2/connection_spec.py`):
+
+```
+use robot audio  ==  a robot connection is present  AND  force_local_audio is False
+```
+
+- **Default (connection present):** speak through the Go2 speaker, listen through
+  the Go2 mic.
+- **No connection (sim, replay, non-robot blueprint):** fall back to local audio
+  out and browser push-to-talk in.
+- **`force_local_audio: true`** (`GlobalConfig`, `dimos/core/global_config.py`):
+  debug override that forces both directions back to the host's local devices
+  even when a robot is connected.
+
+## The speaker track (why one persistent track)
+
+aiortc permanently tears an RTP sender down the first time a track signals
+end-of-file, and the Go2 cannot renegotiate to rebuild it. So a single
+`RobotSpeakerTrack` (`dimos/robot/unitree/robot_speaker_track.py`) is attached
+once and lives for the whole session: it emits digital silence when idle and the
+current clip's frames while speaking, and **never** raises end-of-file. Each new
+utterance just swaps the track's internal source — the sender keeps running.
+
+## The microphone gate (why voice-activity detection)
+
+The Go2 mic is a **continuous** ~50 fps stream that never stops — unlike the
+browser's push-to-talk source it replaced. Feeding it frame-by-frame into Whisper
+would transcribe every ~20 ms fragment, saturate the CPU, and flood the agent
+with blank/hallucinated turns. `VoiceActivityRecorder`
+(`dimos/stream/audio/node_vad_recorder.py`) sits in front of Whisper on the robot
+branch only: it buffers audio once speech begins (with a short pre-roll) and emits
+**one clip per utterance** after trailing silence. Blank transcriptions are also
+dropped before reaching `/human_input`. Detection is **two-stage**:
+
+1. **Adaptive RMS gate (recall).** A frame opens an utterance when it rises
+   `noise_floor_ratio` (×2.0) above the tracked ambient noise floor, and the
+   utterance *continues* at a lower bar (`continuation_ratio`, ×1.4 —
+   hysteresis). Without hysteresis, only the loudest syllables of distant speech
+   stayed above the gate and utterances were chopped into ~1 s fragments, which
+   Whisper misheard badly.
+2. **Silero neural VAD (precision).** Each candidate utterance is confirmed by
+   the Silero voice-activity model (bundled with `faster-whisper`, no extra
+   dependency, ~ms per clip on CPU) before transcription. Candidates with no
+   detected speech — servo whine, dance thuds, jump impacts — are **dropped**,
+   and confirmed speech is **trimmed** to the detected span so Whisper sees
+   speech, not room noise. This is the same class of neural speech detection
+   commercial voice assistants use. If the model can't load it fails *open*
+   (clips pass through unfiltered).
+
+**Wake word (robot mic only).** Utterances transcribed from the robot's mic
+must start with the wake phrase (`wake_word`, default **"hey robot"**) to reach
+the agent; everything else the mic hears is dropped with an
+`Ignored (no wake word): "..."` log line. This keeps ambient conversation in the
+room from becoming prompts. Matching is tolerant of STT noise (casing,
+punctuation, "hey"/"hi"/"a" fillers, close mishearings like "robots"/"Robert"),
+and the phrase is stripped before the command reaches the agent — say
+*"hey robot, walk forward"*. Browser push-to-talk audio and typed text are
+deliberate, so they bypass the gate. Set `wake_word: ""` to disable, or
+`voice_input: false` to turn spoken input off entirely (typed text and the
+speaker keep working).
+
+**About "Hey Benben":** the firmware voice assistant is a separate, closed
+system (its own wake-word engine and near-field tuning on the robot's SoC); its
+models aren't accessible over the SDK/WebRTC surface, and there is no documented
+API to disable it — avoid saying its wake word during operation, since its
+spoken replies ("I'm here") arrive at the mic like any other voice and DimOS
+cannot echo-gate audio it didn't originate. The Silero stage and wake-word gate
+above are the open-source equivalent of that technology on the DimOS side.
+
+**Echo gate (half-duplex):** the Go2's mic hears its own speaker loudly enough to
+trip the voice gate, so while the speaker track is playing a clip (plus a ~1 s
+playout-latency tail) incoming mic frames are dropped at the connection
+(`_ECHO_GATE_TAIL_SECONDS` in `dimos/robot/unitree/connection.py`). Practical
+consequence: the robot cannot hear you *while it is talking* — wait for it to
+finish, then speak.
+
+**Tuning the mic:** the voice gate logs a periodic diagnostic line —
+`Mic level: peak_rms=… noise_floor=… speech_gate=…` — every ~10 s. If your
+speech doesn't trigger transcription, compare your spoken `peak_rms` against
+`speech_gate` in the logs and adjust `speech_rms_threshold` / `noise_floor_ratio`
+on `VoiceActivityRecorder` accordingly. The mic is in the robot's head — speak
+from the front, within a couple of meters. STT uses Whisper (English-only `.en`
+models; weights download on first use): `small.en` when a CUDA GPU is available,
+`base.en` on CPU, overridable with `whisper_model`.
+
+## Speak-by-default (auto-speak)
+
+People next to the robot can't see the agent's text, and LLMs don't reliably
+remember to call the `speak` tool. So `SpeakSkill` subscribes to the agent's
+message stream (`/agent`) and **automatically voices the agent's text replies**,
+including action announcements that accompany tool calls. Turns where the model
+called `speak` itself are skipped, as is text landing within a short cooldown of
+a finished `speak` call (the model's post-speak confirmation chatter, which
+would otherwise be spoken twice). Long dumps are truncated at a sentence
+boundary (~350 chars). Disable with `speak_agent_replies: false` on
+`SpeakSkillConfig`.
+
+## Running on a desktop vs. an embedded host
+
+Nothing in the voice feature is tied to a specific host or CPU architecture —
+it runs unmodified on any Linux machine that can reach the robot's network.
+Whisper's model choice adapts automatically: `small.en` (markedly more accurate
+STT) when a CUDA GPU is available, `base.en` on CPU-only hosts.
+
+## Config knobs
+
+| Setting | Where | Effect |
+|---------|-------|--------|
+| `voice_input` | `GlobalConfig` | Master switch for spoken input; `false` = no STT at all, typed text and speaker unaffected (default on) |
+| `wake_word` | `GlobalConfig` | Phrase robot-mic utterances must start with (default `"hey robot"`; `""` disables the gate) |
+| `whisper_model` | `GlobalConfig` | Whisper STT model; `""` = auto (`small.en` on CUDA, `base.en` on CPU) |
+| `force_local_audio` | `GlobalConfig` | Force both directions to host-local audio (debug override) |
+| `microphone` | `ConnectionConfig` (`dimos/robot/unitree/go2/connection.py`) | Disable the Go2 mic stream while keeping the speaker (`microphone: false`) |
+| `speech_rms_threshold`, `noise_floor_ratio`, `continuation_ratio`, `silence_duration`, `min_speech_duration` | `VoiceActivityRecorder` | Tune when speech starts/stops and which blips are ignored |
+| `use_neural_vad` | `VoiceActivityRecorder` | Silero confirmation/trimming of each utterance (default on) |
+| `speak_agent_replies` | `SpeakSkillConfig` | Auto-speak the agent's text replies (default on) |
+| `set_volume` skill | `SpeakSkill` | Agent-invocable speaker volume 0–10 (Unitree VUI service, `api_id` 1003) — ask the robot to "speak louder" |
+
+## Key files
+
+- `dimos/agents/skills/speak_skill.py` — the `speak` skill and robot-speaker routing
+- `dimos/robot/unitree/robot_speaker_track.py` — persistent outbound speaker track
+- `dimos/robot/unitree/connection.py` — `play_audio_track` (speaker) and `audio_stream` (mic) on the WebRTC connection
+- `dimos/agents/web_human_input.py` — STT source selection and utterance gating
+- `dimos/stream/audio/node_vad_recorder.py` — voice-activity utterance recorder
+- `dimos/stream/audio/resample.py` — 48 kHz stereo → 16 kHz mono for Whisper
+
+
 # Usage
 
 ## Use DimOS as a Library

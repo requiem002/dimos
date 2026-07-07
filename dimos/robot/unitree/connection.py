@@ -48,6 +48,7 @@ from dimos.robot.unitree.type.lidar import (
 )
 from dimos.robot.unitree.type.lowstate import LowStateMsg
 from dimos.robot.unitree.type.odometry import Odometry
+from dimos.stream.audio.base import AudioEvent
 from dimos.types.timestamped import Timestamped
 from dimos.utils.decorators.decorators import simple_mcache
 from dimos.utils.logging_config import setup_logger
@@ -56,6 +57,10 @@ from dimos.utils.reactive import backpressure, callback_to_observable
 VideoMessage: TypeAlias = NDArray[np.uint8]  # Shape: (height, width, 3)
 
 logger = setup_logger()
+
+# How long after the speaker track's last clip frame the mic stays gated,
+# covering network + jitter-buffer + playout latency of the robot's speaker.
+_ECHO_GATE_TAIL_SECONDS = 1.0
 
 
 _T = TypeVar("_T", bound=Timestamped)
@@ -94,6 +99,29 @@ class SerializableVideoFrame:
         return self.data
 
 
+@dataclass
+class SerializableAudioFrame:
+    """Pickleable wrapper for one av.AudioFrame from the robot mic.
+
+    The Go2 mic delivers 48 kHz stereo int16 frames (~960 samples each). We pull
+    the interleaved samples out immediately in the callback so nothing downstream
+    holds a live aiortc frame.
+    """
+
+    data: np.ndarray  # int16, interleaved
+    sample_rate: int
+    channels: int
+
+    @classmethod
+    def from_av_frame(cls, frame):  # type: ignore[no-untyped-def]
+        layout = getattr(frame, "layout", None)
+        channels = len(layout.channels) if layout and layout.channels else 2
+        sample_rate = getattr(frame, "sample_rate", None) or 48000
+        # frombuffer yields a read-only view; copy so downstream owns writable memory.
+        data = np.frombuffer(frame.to_ndarray().tobytes(), dtype=np.int16).copy()
+        return cls(data=data, sample_rate=sample_rate, channels=channels)
+
+
 class UnitreeWebRTCConnection(Resource):
     _SPORT_API_ID_RAGEMODE: int = 2059
 
@@ -102,6 +130,9 @@ class UnitreeWebRTCConnection(Resource):
         self.mode = mode
         self.stop_timer: threading.Timer | None = None
         self.cmd_vel_timeout = 0.2
+        # Persistent outbound audio track for the robot speaker; attached lazily
+        # on the first play_audio_track() call and reused for every utterance.
+        self._speaker_track: Any = None
         # Per-device AES-128 key for new Unitree firmware (data2=3 handshake); omitted when unset.
         self.conn = LegionConnection(
             WebRTCConnectionMethod.LocalSTA, ip=self.ip, aes_128_key=aes_128_key
@@ -220,6 +251,68 @@ class UnitreeWebRTCConnection(Resource):
             logger.warning("Failed to send movement command: %s", e)
             return False
 
+    def play_audio_track(self, audio_path: str) -> None:
+        """Play an audio file through the robot's onboard speaker.
+
+        Routes the file over the EXISTING WebRTC connection (no second
+        connection, no renegotiation) by feeding it to a persistent audio track
+        on the pre-negotiated sendrecv audio sender. Follows the same
+        run_coroutine_threadsafe pattern as move(): the work is scheduled onto
+        the connection's background event loop. Returns as soon as the clip has
+        been handed to the track — it does NOT block for the clip's duration, so
+        concurrent robot commands (move, etc.) are not stalled and long clips
+        cannot trip RPC timeouts.
+        """
+        from dimos.robot.unitree.robot_speaker_track import (
+            RobotSpeakerTrack,
+            decode_clip_to_pcm,
+        )
+
+        # Decode + resample to the wire format HERE, on the calling thread, so
+        # the event loop only ever handles ready-made 48 kHz frames (see
+        # RobotSpeakerTrack docstring for why the format must be exact).
+        try:
+            pcm = decode_clip_to_pcm(audio_path)
+        except Exception as e:
+            logger.warning("Failed to decode audio clip %s: %s", audio_path, e)
+            return
+
+        async def async_play() -> None:
+            if self._speaker_track is None:
+                audio_sender = next(
+                    (s for s in self.conn.pc.getSenders() if s.kind == "audio"), None
+                )
+                if audio_sender is None:
+                    logger.warning("No audio sender on WebRTC connection; cannot play audio")
+                    return
+                track = RobotSpeakerTrack()
+                # replaceTrack (vs addTrack) is renegotiation-free and reuses the
+                # transceiver the library pre-negotiated as sendrecv at connect.
+                audio_sender.replaceTrack(track)
+                self._speaker_track = track
+            self._speaker_track.play_pcm(pcm)
+
+        try:
+            asyncio.run_coroutine_threadsafe(async_play(), self.loop).result()
+        except Exception as e:
+            logger.warning("Failed to play audio on robot speaker: %s", e)
+
+    def set_volume(self, level: int) -> None:
+        """Set the robot's speaker volume, 0 (mute) to 10 (max), via the VUI
+        service on the datachannel (api_id 1003 — the same call the reference
+        library's vui.py example uses)."""
+        level = max(0, min(10, int(level)))
+
+        async def async_set_volume() -> None:
+            await self.conn.datachannel.pub_sub.publish_request_new(
+                RTC_TOPIC["VUI"], {"api_id": 1003, "parameter": {"volume": level}}
+            )
+
+        try:
+            asyncio.run_coroutine_threadsafe(async_set_volume(), self.loop).result()
+        except Exception as e:
+            logger.warning("Failed to set robot speaker volume: %s", e)
+
     # Generic conversion of unitree subscription to Subject (used for all subs)
     def unitree_sub_stream(self, topic_name: str):  # type: ignore[no-untyped-def]
         def subscribe_in_thread(cb) -> None:  # type: ignore[no-untyped-def]
@@ -300,6 +393,71 @@ class UnitreeWebRTCConnection(Resource):
                 ops.map(time_is_now),
             )
         )
+
+    @simple_mcache
+    def raw_audio_stream(self) -> Observable[SerializableAudioFrame]:
+        """Mic frames off the EXISTING WebRTC connection.
+
+        Mirrors raw_video_stream, but the library's audio channel invokes the
+        registered callback with each decoded frame (it runs the recv loop for
+        us), so there is no self-driven recv loop here. Enabling/disabling the
+        mic is scheduled onto the persistent loop, exactly like the video
+        channel switch.
+
+        Half-duplex echo gate: frames are dropped while the speaker track is
+        playing a clip (plus a short tail for playout latency). The Go2's mic
+        picks up its own speaker loudly enough to trigger the STT voice gate,
+        so without this the robot transcribes its own TTS and answers itself.
+        """
+        subject: Subject[SerializableAudioFrame] = Subject()
+
+        async def accept_frame(frame) -> None:  # type: ignore[no-untyped-def]
+            speaker = self._speaker_track
+            if speaker is not None and speaker.recently_active(_ECHO_GATE_TAIL_SECONDS):
+                return
+            subject.on_next(SerializableAudioFrame.from_av_frame(frame))
+
+        self.conn.audio.add_track_callback(accept_frame)
+
+        def switch_audio_channel() -> None:
+            self.conn.audio.switchAudioChannel(True)
+
+        self.loop.call_soon_threadsafe(switch_audio_channel)
+
+        def stop() -> None:
+            try:
+                self.conn.audio.track_callbacks.remove(accept_frame)
+            except ValueError:
+                pass
+
+            def switch_audio_channel_off() -> None:
+                self.conn.audio.switchAudioChannel(False)
+
+            self.loop.call_soon_threadsafe(switch_audio_channel_off)
+
+        return subject.pipe(ops.finally_action(stop))
+
+    @simple_mcache
+    def audio_stream(self) -> Observable[AudioEvent]:
+        """Robot mic as native 48 kHz stereo AudioEvents.
+
+        Consumers (STT) resample to their own rate — the connection stays
+        format-agnostic, mirroring how it publishes a generic Image and lets
+        perception adapt.
+        """
+
+        def to_event(payload: SerializableAudioFrame) -> AudioEvent:
+            data = payload.data
+            if payload.channels > 1:
+                data = data.reshape(-1, payload.channels)
+            return AudioEvent(
+                data=data,
+                sample_rate=payload.sample_rate,
+                timestamp=time.time(),
+                channels=payload.channels,
+            )
+
+        return backpressure(self.raw_audio_stream().pipe(ops.map(to_event)))
 
     @simple_mcache
     def lowstate_stream(self) -> Observable[LowStateMsg]:
