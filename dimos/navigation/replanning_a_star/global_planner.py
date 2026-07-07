@@ -289,8 +289,11 @@ class GlobalPlanner(Resource):
 
         logger.info("Replanning.", attempt=self._replan_limiter.get_attempt())
 
-        assert current_odom is not None
-        assert current_goal is not None
+        if current_odom is None or current_goal is None:
+            # The goal was cancelled (or odometry vanished) between the replan
+            # trigger and this read — e.g. the monitor thread accepted arrival
+            # concurrently. Nothing left to replan.
+            return
 
         if current_goal.position.distance(current_odom.position) < self._replan_goal_tolerance:
             self.cancel_goal(arrived=True)
@@ -315,7 +318,12 @@ class GlobalPlanner(Resource):
             current_odom = self._current_odom
             current_goal = self._current_goal
 
-        assert current_goal is not None
+        if current_goal is None:
+            # Cancelled concurrently: the monitor thread can accept the goal as
+            # arrived ("Close enough to goal") between handle_goal_request
+            # storing it and this read. Previously an assert here crashed the
+            # calling LCM handler thread.
+            return
 
         if current_odom is None:
             logger.warning("Cannot handle goal request: missing odometry.")
@@ -349,16 +357,40 @@ class GlobalPlanner(Resource):
         #        sizes_to_try: list[float] = [2.2, 1.7, 1.3, 1]
         sizes_to_try: list[float] = [1.1]
 
+        costmap: OccupancyGrid | None = None
         for size in sizes_to_try:
             distance = robot_pos.distance(goal)
             navigation_map = self._navigation_map if distance > 1.5 else self._navigation_map_near
-            costmap = navigation_map.make_gradient_costmap(size)
+            # Clear the robot's own footprint so lidar self-hits (from sit/
+            # dance/jump poses) can't wall the start cell in.
+            costmap = navigation_map.make_gradient_costmap(size, clear_footprint=robot_pos)
             path = min_cost_astar(costmap, goal, robot_pos)
             if path and path.poses:
                 logger.info(f"Found path {size}x robot width.")
                 return path
 
+        if costmap is not None:
+            self._log_path_failure_diagnostics(costmap, robot_pos)
         return None
+
+    def _log_path_failure_diagnostics(self, costmap: OccupancyGrid, robot_pos: Vector3) -> None:
+        """Log why A* failed so field logs are actionable: how blocked is the
+        area around the robot? A high lethal fraction means the map (not the
+        goal) is the problem — e.g. phantom obstacles painted around the robot."""
+        grid_pos = costmap.world_to_grid(robot_pos)
+        sx, sy = int(grid_pos.x), int(grid_pos.y)
+        if not (0 <= sx < costmap.width and 0 <= sy < costmap.height):
+            logger.warning("A* diagnostics: robot position is outside the costmap.")
+            return
+        window = max(1, int(0.5 / costmap.resolution))
+        region = costmap.grid[
+            max(0, sy - window) : sy + window + 1, max(0, sx - window) : sx + window + 1
+        ]
+        lethal_pct = 100.0 * float((region >= CostValues.OCCUPIED).mean()) if region.size else 0.0
+        logger.warning(
+            f"A* failed: start cell cost={int(costmap.grid[sy, sx])}, "
+            f"{lethal_pct:.0f}% of cells within 0.5m of the robot are lethal."
+        )
 
     def _find_safe_goal(self, goal: Vector3) -> Vector3 | None:
         costmap = self._navigation_map.binary_costmap

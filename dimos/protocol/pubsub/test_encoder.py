@@ -169,3 +169,29 @@ def test_data_actually_encoded_in_transit() -> None:
     # Verify it's actually JSON
     decoded_raw = json.loads(raw_message.decode("utf-8"))
     assert decoded_raw == original_message
+
+
+def test_lcm_decode_retries_on_plum_resolution_race() -> None:
+    """First-decode of an LCM message type resolves plum/beartype annotations by
+    mutating shared state; a concurrent first-decode on another thread can die
+    with AssertionError("... not stringified type hint"). decode() must retry
+    (resolution is idempotent) instead of dropping the message."""
+    from dimos.protocol.pubsub.encoders import LCMEncoderMixin
+
+    calls = {"n": 0}
+
+    class FlakyLcmType:
+        @staticmethod
+        def lcm_decode(msg: bytes) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise AssertionError("dict[str, ...] not stringified type hint.")
+            return "decoded"
+
+    class Topic:
+        topic = "/flaky"
+        lcm_type = FlakyLcmType
+
+    mixin = LCMEncoderMixin.__new__(LCMEncoderMixin)
+    assert mixin.decode(b"payload", Topic()) == "decoded"
+    assert calls["n"] == 2
