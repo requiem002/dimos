@@ -97,6 +97,12 @@ def _go2_rerun_blueprint() -> Any:
 
 rerun_config: dict[str, Any] = {
     "blueprint": _go2_rerun_blueprint,
+    # Cap the Rerun viewer's history buffer. The default is 25% of system RAM,
+    # which on a long exploration run grows until the whole machine is under
+    # memory pressure and the nav/lidar pipeline starts dropping frames. At the
+    # cap Rerun silently discards its OLDEST visualization data — live streams
+    # are unaffected. Matches the 1GB cap other robot blueprints use.
+    "memory_limit": "1GB",
     # Custom converters for specific rerun entity paths
     # Normally all these would be specified in their respectative modules
     # Until this is implemented we have central overrides here
